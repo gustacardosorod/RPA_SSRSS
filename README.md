@@ -302,3 +302,63 @@ Resultado da carga completa validada com os arquivos do ZIP:
 - `f_gov_chamados_tratado.csv`: 7.408 linhas
 
 A planilha GOV veio com referência de célula inválida no XML interno. O ETL GOV possui leitor próprio para esse caso e não depende do `read_excel` puro.
+
+## Correção aplicada - EmptyDataError no Streamlit
+
+Foi adicionada leitura tolerante para CSVs vazios, incompletos ou com separador/encoding diferente.
+
+O erro corrigido era:
+
+```text
+pandas.errors.EmptyDataError
+```
+
+A causa provável era a tela de pré-visualização tentando abrir um `.csv` vazio na pasta `saida/` ou `LOGS/`. Agora o app:
+
+- ignora CSVs vazios na prévia;
+- exibe aviso em vez de quebrar;
+- tenta ler `;`, `,`, tabulação e `|`;
+- tenta `utf-8-sig`, `utf-8` e `latin1`;
+- não gera Excel para arquivos vazios;
+- mantém os arquivos vazios dentro do ZIP de exportação para auditoria.
+
+
+## Relatórios obrigatórios gerados
+
+O sistema deve entregar os arquivos abaixo na pasta `saida/` para consumo no Power BI:
+
+| Arquivo | Origem / finalidade |
+|---|---|
+| `dim_atendentes.csv` | Dimensão de atendentes |
+| `f_agent_contact_diario.csv` | Ligações e TMA por agente |
+| `f_css_atendente.csv` | CSS por atendente |
+| `f_css_geral_diario.csv` | CSS geral diário |
+| `f_fsr_tratado.csv` | SAP Service / FSR tratado |
+| `f_indicadores_gerais.csv` | Indicadores consolidados gerais |
+| `f_reclamacoes_sap_tratado.csv` | Reclamações SAP tratadas |
+| `f_volume_fila_diario.csv` | Volume diário por fila |
+| `f_volume_geral_diario.csv` | Volume geral diário |
+| `f_gov_chamados_tratado.csv` | GOV Chamados tratado |
+
+Além disso, a carga GOV Chamados pode gerar dimensões auxiliares:
+
+- `dim_status_chamados.csv`
+- `dim_unidades_chamados.csv`
+- `dim_responsaveis_chamados.csv`
+- `dim_categorias_chamados.csv`
+
+No Streamlit, a tela inicial e a tela de exportação mostram um checklist desses arquivos com status `Gerado`, `Vazio` ou `Faltando`.
+
+### Como gerar incluindo GOV Chamados
+
+```bash
+python main.py --carga tudo --reprocessar-tudo
+```
+
+Ou somente GOV Chamados:
+
+```bash
+python main.py --carga gov_chamados --reprocessar-tudo
+```
+
+No Streamlit, use a carga **Tudo disponível** para tentar gerar todas as bases enviadas, ou **GOV Chamados** para gerar apenas `f_gov_chamados_tratado.csv`.

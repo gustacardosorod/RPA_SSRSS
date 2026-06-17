@@ -12,6 +12,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
 import streamlit as st
+from pandas.errors import EmptyDataError, ParserError
 
 from app import executar_carga
 from common import VERSAO_APP
@@ -46,6 +47,26 @@ CARGAS_ONLINE = {
     "FSR / SAP Service": "fsr",
     "Reclamações SAP": "reclamacoes_sap",
     "GOV Chamados": "gov_chamados",
+}
+
+RELATORIOS_OBRIGATORIOS = {
+    "dim_atendentes.csv": "Dimensão de atendentes para relacionamento no Power BI",
+    "f_agent_contact_diario.csv": "Fato diária por agente, com ligações e TMA",
+    "f_css_atendente.csv": "CSS por atendente",
+    "f_css_geral_diario.csv": "CSS geral diário",
+    "f_fsr_tratado.csv": "Base tratada de FSR / SAP Service",
+    "f_indicadores_gerais.csv": "Indicadores consolidados gerais",
+    "f_reclamacoes_sap_tratado.csv": "Reclamações SAP tratadas",
+    "f_volume_fila_diario.csv": "Volume diário por fila",
+    "f_volume_geral_diario.csv": "Volume geral diário",
+    "f_gov_chamados_tratado.csv": "GOV Chamados tratado",
+}
+
+DIMENSOES_GOV = {
+    "dim_status_chamados.csv": "Status padronizados dos chamados GOV",
+    "dim_unidades_chamados.csv": "Unidades/empresas dos chamados GOV",
+    "dim_responsaveis_chamados.csv": "Responsáveis dos chamados GOV",
+    "dim_categorias_chamados.csv": "Categorias dos chamados GOV",
 }
 
 MODOS = {
@@ -126,8 +147,67 @@ def listar_arquivos_relativos(pasta: Path) -> List[str]:
     return sorted(str(p.relative_to(pasta)) for p in pasta.rglob("*") if p.is_file())
 
 
+def csv_tem_conteudo(caminho: Path) -> bool:
+    """Retorna False para CSV inexistente, zerado ou só com espaços/quebras de linha."""
+    caminho = Path(caminho)
+    if not caminho.exists() or not caminho.is_file():
+        return False
+    if caminho.stat().st_size == 0:
+        return False
+    try:
+        amostra = caminho.read_bytes()[:4096]
+        return bool(amostra.strip())
+    except Exception:
+        return False
+
+
 def ler_csv_saida(caminho: Path, nrows=None) -> pd.DataFrame:
-    return pd.read_csv(caminho, sep=";", encoding="utf-8-sig", dtype=str, nrows=nrows)
+    """Lê CSV de saída/log sem derrubar o Streamlit quando o arquivo estiver vazio ou estranho.
+
+    Alguns ETLs podem criar arquivos vazios quando a carga falha, quando não há dados válidos
+    ou quando o Streamlit Cloud reinicia no meio da brincadeira. Nesses casos, devolvemos
+    um DataFrame vazio e a tela mostra um aviso amigável.
+    """
+    caminho = Path(caminho)
+    if not csv_tem_conteudo(caminho):
+        return pd.DataFrame()
+
+    candidatos = []
+    ultimo_erro = None
+    for encoding in ("utf-8-sig", "utf-8", "latin1"):
+        for sep in (";", ",", "\t", "|"):
+            try:
+                df = pd.read_csv(
+                    caminho,
+                    sep=sep,
+                    encoding=encoding,
+                    dtype=str,
+                    nrows=nrows,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+                candidatos.append((len(df.columns), len(df), df))
+            except EmptyDataError:
+                return pd.DataFrame()
+            except (UnicodeDecodeError, ParserError, ValueError, OSError) as exc:
+                ultimo_erro = exc
+                continue
+
+    if candidatos:
+        candidatos.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidatos[0][2]
+
+    if ultimo_erro:
+        raise ultimo_erro
+    return pd.DataFrame()
+
+
+def listar_csvs_validos(pasta: Path) -> Tuple[List[Path], List[Path]]:
+    """Separa CSVs com conteúdo dos CSVs vazios/incompletos."""
+    arquivos = sorted(Path(pasta).glob("*.csv")) if Path(pasta).exists() else []
+    validos = [p for p in arquivos if csv_tem_conteudo(p)]
+    vazios = [p for p in arquivos if p not in validos]
+    return validos, vazios
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -203,18 +283,76 @@ def executar_carga_online(carga: str, substituir: bool, reprocessar_tudo: bool) 
 
 
 def mostrar_kpis_saida() -> None:
-    arquivos = sorted(pastas()["saida"].glob("*.csv"))
+    arquivos, vazios = listar_csvs_validos(pastas()["saida"])
+    logs, _ = listar_csvs_validos(pastas()["logs"])
     cols = st.columns(4)
     cols[0].metric("Arquivos tratados", len(arquivos))
     total_linhas = 0
     for arq in arquivos:
         try:
-            total_linhas += max(sum(1 for _ in arq.open("r", encoding="utf-8-sig")) - 1, 0)
+            df_tmp = ler_csv_saida(arq, nrows=None)
+            total_linhas += len(df_tmp)
         except Exception:
             pass
     cols[1].metric("Linhas nas saídas", f"{total_linhas:,}".replace(",", "."))
-    cols[2].metric("Logs", len(list(pastas()["logs"].glob("*.csv"))))
+    cols[2].metric("Logs", len(logs))
     cols[3].metric("Versão", VERSAO_APP.split("_")[0])
+    if vazios:
+        st.caption(f"{len(vazios)} arquivo(s) CSV vazio(s)/incompleto(s) foram ignorados nos indicadores.")
+
+
+def verificar_relatorios_obrigatorios() -> pd.DataFrame:
+    """Monta checklist dos arquivos que o sistema precisa entregar para o Power BI."""
+    saida = pastas()["saida"]
+    linhas = []
+    for nome, descricao in {**RELATORIOS_OBRIGATORIOS, **DIMENSOES_GOV}.items():
+        caminho = saida / nome
+        existe = caminho.exists()
+        tem_conteudo = csv_tem_conteudo(caminho)
+        linhas_csv = None
+        colunas_csv = None
+        if tem_conteudo:
+            try:
+                df = ler_csv_saida(caminho)
+                linhas_csv = len(df)
+                colunas_csv = len(df.columns)
+            except Exception:
+                linhas_csv = None
+                colunas_csv = None
+        if not existe:
+            status = "❌ Faltando"
+        elif not tem_conteudo:
+            status = "⚠️ Vazio"
+        else:
+            status = "✅ Gerado"
+        linhas.append(
+            {
+                "Status": status,
+                "Arquivo": nome,
+                "Tipo": "Obrigatório" if nome in RELATORIOS_OBRIGATORIOS else "Dimensão GOV",
+                "Linhas": linhas_csv,
+                "Colunas": colunas_csv,
+                "Descrição": descricao,
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
+def mostrar_checklist_relatorios(expandido: bool = True) -> None:
+    st.subheader("📌 Relatórios que o sistema deve gerar")
+    checklist = verificar_relatorios_obrigatorios()
+    total = len(checklist)
+    gerados = int(checklist["Status"].astype(str).str.contains("Gerado").sum()) if not checklist.empty else 0
+    faltando = total - gerados
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Esperados", total)
+    c2.metric("Gerados", gerados)
+    c3.metric("Faltando/vazios", faltando)
+    st.dataframe(checklist, use_container_width=True, hide_index=True)
+    if faltando:
+        st.warning("Há relatório obrigatório faltando ou vazio. Rode a carga correspondente ou envie os arquivos de entrada corretos.")
+    else:
+        st.success("Todos os relatórios obrigatórios foram encontrados com conteúdo.")
 
 
 def tela_inicio() -> None:
@@ -236,6 +374,7 @@ A parte online processa arquivos enviados pelo usuário. Extração automática 
     )
 
     mostrar_kpis_saida()
+    mostrar_checklist_relatorios(expandido=True)
 
     st.info(
         "Fluxo recomendado: envie um ZIP com a estrutura completa do projeto ou suba os arquivos por tipo de carga, depois vá em ⚙️ Processar ETL."
@@ -273,6 +412,8 @@ def tela_importar() -> None:
         st.caption("Envie os CSVs do lote: Volume 4 - Daily, Agent Contact, Script Result 5 e Script Result 3.")
     else:
         destino = destino_base
+        if tipo == "GOV Chamados":
+            st.caption("Para GOV Chamados, envie o XLSX/CSV exportado do SAP/GOV. A saída obrigatória será f_gov_chamados_tratado.csv e as dimensões dim_*_chamados.csv.")
 
     uploads = st.file_uploader(
         "Selecione os arquivos",
@@ -333,17 +474,25 @@ def tela_processar() -> None:
             st.error(f"Erro ao executar carga: {exc}")
 
     mostrar_kpis_saida()
+    mostrar_checklist_relatorios(expandido=True)
 
 
 def tela_preview() -> None:
     st.header("📊 Pré-visualizar dados")
-    arquivos = sorted(pastas()["saida"].glob("*.csv"))
+    arquivos, vazios = listar_csvs_validos(pastas()["saida"])
+    if vazios:
+        with st.expander("Arquivos ignorados na prévia"):
+            st.write([p.name for p in vazios])
+            st.caption("Esses CSVs estão vazios ou incompletos. O app não vai cair por causa deles, porque já basta a gravidade.")
     if not arquivos:
-        st.warning("Nenhum CSV tratado encontrado. Rode o ETL primeiro, essa etapa inconveniente chamada 'ter dados'.")
+        st.warning("Nenhum CSV tratado com conteúdo encontrado. Rode o ETL primeiro, essa etapa inconveniente chamada 'ter dados'.")
         return
 
     arquivo = st.selectbox("Arquivo tratado", arquivos, format_func=lambda p: p.name)
     df = ler_csv_saida(arquivo)
+    if df.empty and len(df.columns) == 0:
+        st.warning(f"O arquivo {arquivo.name} está vazio ou não pôde ser lido com segurança.")
+        return
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Linhas", f"{len(df):,}".replace(",", "."))
@@ -389,12 +538,15 @@ def tela_preview() -> None:
 
 def tela_exportar() -> None:
     st.header("📥 Exportar arquivos tratados")
-    arquivos = sorted(pastas()["saida"].glob("*.csv"))
-    logs = sorted(pastas()["logs"].glob("*.csv"))
+    arquivos, arquivos_vazios = listar_csvs_validos(pastas()["saida"])
+    logs, logs_vazios = listar_csvs_validos(pastas()["logs"])
 
-    if not arquivos and not logs:
+    if not arquivos and not logs and not arquivos_vazios and not logs_vazios:
         st.warning("Nada para exportar ainda.")
         return
+
+    if arquivos_vazios or logs_vazios:
+        st.info(f"CSV(s) vazio(s)/incompleto(s) detectado(s): {len(arquivos_vazios) + len(logs_vazios)}. Eles entram no ZIP, mas não viram Excel.")
 
     st.download_button(
         "Baixar pacote completo ZIP",
@@ -405,8 +557,16 @@ def tela_exportar() -> None:
     )
 
     st.divider()
+    st.subheader("Arquivos obrigatórios para Power BI")
+    mostrar_checklist_relatorios(expandido=True)
+
+    st.divider()
     st.subheader("Arquivos tratados")
-    for arquivo in arquivos:
+    arquivos_ordenados = sorted(
+        arquivos,
+        key=lambda p: (0 if p.name in RELATORIOS_OBRIGATORIOS else 1, p.name),
+    )
+    for arquivo in arquivos_ordenados:
         with st.expander(arquivo.name):
             data = arquivo.read_bytes()
             st.download_button(
@@ -451,14 +611,20 @@ def tela_logs() -> None:
             st.code(st.session_state.console)
 
     st.subheader("Arquivos de log")
-    arquivos = sorted(pastas()["logs"].glob("*.csv"))
+    arquivos, vazios = listar_csvs_validos(pastas()["logs"])
+    if vazios:
+        st.caption(f"{len(vazios)} log(s) vazio(s)/incompleto(s) foram ignorados na visualização.")
     if not arquivos:
-        st.info("Nenhum log salvo ainda.")
+        st.info("Nenhum log com conteúdo salvo ainda.")
         return
 
     arquivo = st.selectbox("Log", arquivos, format_func=lambda p: p.name)
     try:
-        st.dataframe(ler_csv_saida(arquivo), use_container_width=True)
+        df_log = ler_csv_saida(arquivo)
+        if df_log.empty and len(df_log.columns) == 0:
+            st.info("Log vazio.")
+        else:
+            st.dataframe(df_log, use_container_width=True)
     except Exception:
         st.text(arquivo.read_text(encoding="utf-8-sig", errors="replace"))
 
@@ -471,6 +637,21 @@ def tela_sobre() -> None:
 ### O que este app faz
 
 Este Streamlit é o front-end do RPA de tratamento. Ele recebe os relatórios exportados, executa os ETLs e devolve as bases prontas para Power BI.
+
+### Relatórios finais obrigatórios
+
+- `dim_atendentes.csv`
+- `f_agent_contact_diario.csv`
+- `f_css_atendente.csv`
+- `f_css_geral_diario.csv`
+- `f_fsr_tratado.csv`
+- `f_indicadores_gerais.csv`
+- `f_reclamacoes_sap_tratado.csv`
+- `f_volume_fila_diario.csv`
+- `f_volume_geral_diario.csv`
+- `f_gov_chamados_tratado.csv`
+
+O GOV Chamados também gera dimensões auxiliares quando houver dados: `dim_status_chamados.csv`, `dim_unidades_chamados.csv`, `dim_responsaveis_chamados.csv` e `dim_categorias_chamados.csv`.
 
 ### O que ele não faz sozinho online
 
