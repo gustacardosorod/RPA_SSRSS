@@ -1,0 +1,6 @@
+pandas>=2.2.0
+numpy>=1.26.0
+streamlit>=1.37.0
+openpyxl>=3.1.2
+charset-normalizer>=3.3.2
+python-dateutil>=2.9.0
