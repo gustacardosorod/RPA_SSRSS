@@ -6,3 +6,4 @@ venv/
 saida/
 LOGS/
 .streamlit/secrets.toml
+*.crt
