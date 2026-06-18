@@ -362,3 +362,127 @@ python main.py --carga gov_chamados --reprocessar-tudo
 ```
 
 No Streamlit, use a carga **Tudo disponível** para tentar gerar todas as bases enviadas, ou **GOV Chamados** para gerar apenas `f_gov_chamados_tratado.csv`.
+
+## Banco CockroachDB Cloud
+
+Esta versão também possui integração com CockroachDB Cloud para guardar histórico das cargas tratadas.
+
+Arquivos adicionados:
+
+```text
+db_cockroach.py
+sql/cockroachdb_schema.sql
+.streamlit/secrets.toml.example
+```
+
+### Fluxo recomendado
+
+```text
+1. Usuário sobe relatórios no Streamlit
+2. Streamlit executa ETL
+3. CSVs são gerados na pasta saida
+4. Aba 🗄️ Banco CockroachDB envia os CSVs para o banco
+5. log_cargas registra cada envio
+6. Power BI pode consumir o CockroachDB depois
+```
+
+### Criar cluster no CockroachDB
+
+1. Acesse CockroachDB Cloud.
+2. Crie um cluster Basic/Free.
+3. Abra o cluster e clique em **Connect**.
+4. Copie a connection string PostgreSQL.
+5. Use a base `defaultdb` na conexão inicial.
+6. O app cria o database do projeto com o nome `rpa_ssrs`.
+
+### Configurar Secrets no Streamlit Cloud
+
+No Streamlit Cloud:
+
+```text
+Manage app → Settings → Secrets
+```
+
+Cole o bloco abaixo, ajustando com os dados reais do CockroachDB:
+
+```toml
+[cockroachdb]
+database_url = "postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
+database_name = "rpa_ssrs"
+```
+
+Nunca suba senha no GitHub. Use apenas o arquivo `.streamlit/secrets.toml.example` como modelo.
+
+### Usar pelo app
+
+No menu lateral do Streamlit, acesse:
+
+```text
+🗄️ Banco CockroachDB
+```
+
+Use nesta ordem:
+
+```text
+1. Testar conexão
+2. Criar database e tabelas de controle
+3. Rodar ETL na aba ⚙️ Processar ETL
+4. Voltar para 🗄️ Banco CockroachDB
+5. Enviar saídas para CockroachDB
+6. Consultar log_cargas
+```
+
+### Tabelas de controle
+
+O app cria automaticamente:
+
+```text
+log_cargas
+controle_cargas
+```
+
+As tabelas finais são criadas automaticamente a partir dos CSVs gerados:
+
+```text
+dim_atendentes
+f_agent_contact_diario
+f_css_atendente
+f_css_geral_diario
+f_fsr_tratado
+f_indicadores_gerais
+f_reclamacoes_sap_tratado
+f_volume_fila_diario
+f_volume_geral_diario
+f_gov_chamados_tratado
+dim_status_chamados
+dim_unidades_chamados
+dim_responsaveis_chamados
+dim_categorias_chamados
+```
+
+### Modo append x replace
+
+- `append`: mantém histórico das cargas. Recomendado para produção.
+- `replace`: apaga e recria a tabela destino. Use apenas para teste ou correção pesada.
+
+Por padrão, use `append`. O objetivo aqui é guardar histórico, não brincar de roleta russa com a base.
+
+### Rodar local com variável de ambiente
+
+Também é possível rodar local sem Streamlit Secrets:
+
+Windows PowerShell:
+
+```powershell
+$env:COCKROACH_DATABASE_URL="postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
+$env:COCKROACH_DATABASE_NAME="rpa_ssrs"
+streamlit run streamlit_app.py
+```
+
+Linux/macOS:
+
+```bash
+export COCKROACH_DATABASE_URL="postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
+export COCKROACH_DATABASE_NAME="rpa_ssrs"
+streamlit run streamlit_app.py
+```

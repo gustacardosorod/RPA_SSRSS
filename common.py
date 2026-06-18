@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-VERSAO_APP = "2026-06-17_RPA_SSRS_V6_RELATORIOS_OBRIGATORIOS_GOV"
+VERSAO_APP = "2026-06-18_RPA_SSRS_V7_COCKROACHDB"
 
 ARQUIVOS = {
     "volume": "Volume 4 - Daily",

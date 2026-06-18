@@ -23,6 +23,14 @@ from etl_gov_chamados import processar_gov_chamados
 from etl_indicadores_gerais import processar_indicadores_gerais
 from etl_reclamacoes_sap import processar_reclamacoes_sap
 from etl_volume_fila_diario import processar_volume_fila
+from db_cockroach import (
+    consultar_log_cargas,
+    enviar_pasta_saida_para_banco,
+    listar_tabelas,
+    obter_database_name,
+    preparar_database,
+    testar_conexao,
+)
 
 st.set_page_config(
     page_title="RPA SSRS + SAP + GOV",
@@ -629,6 +637,123 @@ def tela_logs() -> None:
         st.text(arquivo.read_text(encoding="utf-8-sig", errors="replace"))
 
 
+
+def tela_banco_cockroach() -> None:
+    st.header("🗄️ Banco CockroachDB")
+
+    st.markdown(
+        """
+Esta tela conecta o app ao **CockroachDB Cloud** para guardar o histórico das cargas tratadas.
+
+Fluxo correto:
+
+```text
+Streamlit processa os arquivos
+        ↓
+Gera CSVs na pasta saida
+        ↓
+Envia os CSVs para o CockroachDB
+        ↓
+Power BI pode consumir o banco depois
+```
+
+O banco fica no CockroachDB, não dentro do Streamlit. O Streamlit só conecta e grava, porque ele tem amor-próprio suficiente para não fingir que é servidor de banco.
+        """
+    )
+
+    with st.expander("1) Como configurar o CockroachDB no Streamlit Cloud", expanded=True):
+        st.markdown(
+            """
+1. Crie um cluster no CockroachDB Cloud.
+2. No cluster, clique em **Connect**.
+3. Copie a conexão no formato PostgreSQL.
+4. No Streamlit Cloud, entre em **Manage app → Settings → Secrets**.
+5. Cole o bloco abaixo, trocando usuário, senha e host.
+            """
+        )
+        st.code(
+            '''[cockroachdb]
+database_url = "postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
+database_name = "rpa_ssrs"''',
+            language="toml",
+        )
+        st.warning("Nunca coloque senha no código nem no GitHub. O GitHub não esquece, ele apenas espera sua carreira passar vergonha.")
+
+    st.divider()
+    st.subheader("Conexão")
+    nome_db = st.text_input("Nome do database do projeto", value=obter_database_name("rpa_ssrs"))
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if st.button("Testar conexão", type="primary"):
+            try:
+                info = testar_conexao()
+                st.success("Conexão OK com o cluster.")
+                st.json(info)
+            except Exception as exc:
+                st.error(f"Falha na conexão: {exc}")
+
+    with col2:
+        if st.button("Criar database e tabelas de controle"):
+            try:
+                db = preparar_database(nome_db)
+                st.success(f"Database `{db}` pronto com tabelas de controle.")
+            except Exception as exc:
+                st.error(f"Erro ao preparar database: {exc}")
+
+    with col3:
+        if st.button("Listar tabelas"):
+            try:
+                df_tabs = listar_tabelas(nome_db)
+                st.dataframe(df_tabs, use_container_width=True, hide_index=True)
+            except Exception as exc:
+                st.error(f"Erro ao listar tabelas: {exc}")
+
+    st.divider()
+    st.subheader("Enviar cargas tratadas para o banco")
+    st.caption("Primeiro rode o ETL. Depois envie os CSVs da pasta `saida` para o CockroachDB.")
+
+    checklist = verificar_relatorios_obrigatorios()
+    st.dataframe(checklist, use_container_width=True, hide_index=True)
+
+    apenas_padrao = st.checkbox("Enviar apenas relatórios oficiais do projeto", value=True)
+    modo_envio = st.selectbox(
+        "Modo de gravação no banco",
+        ["append", "replace"],
+        index=0,
+        help="append guarda histórico de cargas. replace recria a tabela, use só em teste ou correção pesada.",
+    )
+
+    if modo_envio == "replace":
+        st.warning("Modo replace apaga e recria a tabela destino. Sim, é aquele botão que parece útil até alguém perguntar cadê o histórico.")
+
+    if st.button("Enviar saídas para CockroachDB", type="primary"):
+        try:
+            resultados = enviar_pasta_saida_para_banco(
+                pastas()["saida"],
+                database_name=nome_db,
+                apenas_padrao=apenas_padrao,
+                if_exists=modo_envio,
+            )
+            if resultados:
+                st.success("Envio finalizado.")
+                st.dataframe(pd.DataFrame(resultados), use_container_width=True, hide_index=True)
+            else:
+                st.warning("Nenhum CSV encontrado para enviar. Rode o ETL antes, essa pequena superstição chamada processamento.")
+        except Exception as exc:
+            st.error(f"Erro ao enviar dados para o CockroachDB: {exc}")
+
+    st.divider()
+    st.subheader("Histórico de cargas no banco")
+    limite = st.number_input("Limite de registros", min_value=10, max_value=1000, value=100, step=10)
+    if st.button("Consultar log_cargas"):
+        try:
+            df_log = consultar_log_cargas(nome_db, limite=int(limite))
+            st.dataframe(df_log, use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error(f"Erro ao consultar histórico: {exc}")
+
 def tela_sobre() -> None:
     st.header("ℹ️ Sobre o projeto e deploy")
 
@@ -692,6 +817,24 @@ python main.py --carga tudo --reprocessar-tudo
 python main.py --carga gov_chamados --reprocessar-tudo
 ```
 
+### Banco CockroachDB
+
+O app possui uma aba `🗄️ Banco CockroachDB` para:
+
+- testar conexão com o cluster;
+- criar o database `rpa_ssrs`;
+- criar `log_cargas` e `controle_cargas`;
+- enviar os CSVs tratados da pasta `saida` para o banco;
+- consultar histórico das cargas.
+
+Configure os secrets no Streamlit Cloud usando:
+
+```toml
+[cockroachdb]
+database_url = "postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
+database_name = "rpa_ssrs"
+```
+
 ### Deploy no Streamlit Community Cloud
 
 1. Suba este projeto em um repositório GitHub.
@@ -715,6 +858,7 @@ with st.sidebar:
             "📊 Pré-visualizar dados",
             "📥 Exportar arquivos tratados",
             "🧾 Logs do processamento",
+            "🗄️ Banco CockroachDB",
             "ℹ️ Sobre o projeto",
         ],
     )
@@ -735,5 +879,7 @@ elif pagina == "📥 Exportar arquivos tratados":
     tela_exportar()
 elif pagina == "🧾 Logs do processamento":
     tela_logs()
+elif pagina == "🗄️ Banco CockroachDB":
+    tela_banco_cockroach()
 else:
     tela_sobre()
