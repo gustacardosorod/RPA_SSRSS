@@ -40,6 +40,26 @@ ARQUIVOS_PADRAO: Dict[str, str] = {
     "dim_categorias_chamados.csv": "dim_categorias_chamados",
 }
 
+# Chaves usadas no envio incremental para o banco.
+# Os nomes abaixo já estão no padrão SQL, ou seja, minúsculos e sem acento.
+# Sem isso, o banco vira um depósito de duplicidade com iluminação ruim.
+CHAVES_UNICAS_BANCO: Dict[str, List[str]] = {
+    "dim_atendentes": ["atendente_id"],
+    "f_agent_contact_diario": ["data", "atendente_id", "grupo"],
+    "f_css_atendente": ["periodo_inicio", "periodo_fim", "atendente_id"],
+    "f_css_geral_diario": ["data"],
+    "f_fsr_tratado": ["chave_fsr"],
+    "f_indicadores_gerais": ["data"],
+    "f_reclamacoes_sap_tratado": ["chave_sap"],
+    "f_volume_fila_diario": ["data", "fila"],
+    "f_volume_geral_diario": ["data"],
+    "f_gov_chamados_tratado": ["chave_gov"],
+    "dim_status_chamados": ["status_padronizado"],
+    "dim_unidades_chamados": ["unidade", "empresa"],
+    "dim_responsaveis_chamados": ["responsavel", "departamento_responsavel"],
+    "dim_categorias_chamados": ["categoria", "subcategoria", "categoria_causa", "categoria_resolucao", "categoria_objeto"],
+}
+
 
 def _get_secret_value(secao: str, chave: str) -> Optional[str]:
     """Lê secrets do Streamlit sem quebrar execução local."""
@@ -260,6 +280,162 @@ def ler_csv_seguro(caminho: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+
+def preparar_dataframe_para_banco(
+    df: pd.DataFrame,
+    id_carga: str,
+    arquivo_origem: str,
+) -> pd.DataFrame:
+    """Normaliza colunas e adiciona metadados técnicos antes da gravação."""
+    if df.empty and len(df.columns) == 0:
+        return pd.DataFrame()
+    out = normalizar_colunas_para_sql(df)
+    out = out.astype("string").fillna("")
+    out["id_carga"] = id_carga
+    out["data_hora_carga"] = datetime.now(timezone.utc).isoformat()
+    out["arquivo_origem"] = arquivo_origem
+    return out
+
+
+def tabela_existe(engine: Engine, tabela: str) -> bool:
+    tabela_sql = limpar_identificador(tabela)
+    query = text(
+        """
+        SELECT count(*) AS qtd
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = :tabela
+        """
+    )
+    with engine.connect() as conn:
+        qtd = conn.execute(query, {"tabela": tabela_sql}).scalar_one()
+    return int(qtd or 0) > 0
+
+
+def colunas_da_tabela(engine: Engine, tabela: str) -> List[str]:
+    tabela_sql = limpar_identificador(tabela)
+    query = text(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = :tabela
+        ORDER BY ordinal_position
+        """
+    )
+    with engine.connect() as conn:
+        return [str(row[0]) for row in conn.execute(query, {"tabela": tabela_sql}).all()]
+
+
+def garantir_colunas_tabela(engine: Engine, tabela: str, df: pd.DataFrame) -> None:
+    """Adiciona colunas novas no banco antes do append.
+
+    Isso evita erro quando o ETL passa a gerar uma coluna nova. Porque claro,
+    até coluna resolve nascer depois da reunião de homologação.
+    """
+    if df.empty:
+        return
+    tabela_sql = limpar_identificador(tabela)
+    if not tabela_existe(engine, tabela_sql):
+        return
+    existentes = set(colunas_da_tabela(engine, tabela_sql))
+    faltantes = [col for col in df.columns if col not in existentes]
+    if not faltantes:
+        return
+    with engine.begin() as conn:
+        for col in faltantes:
+            col_sql = limpar_identificador(col)
+            conn.execute(text(f'ALTER TABLE "{tabela_sql}" ADD COLUMN IF NOT EXISTS "{col_sql}" STRING'))
+
+
+def chave_linha_banco(df: pd.DataFrame, colunas_chave: List[str]) -> pd.Series:
+    """Gera chave normalizada para comparação entre CSV tratado e banco."""
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    partes = []
+    for col in colunas_chave:
+        if col not in df.columns:
+            serie = pd.Series([""] * len(df), index=df.index, dtype="string")
+        else:
+            serie = df[col].fillna("").astype(str).str.strip().str.upper()
+        partes.append(serie)
+    chave = partes[0]
+    for parte in partes[1:]:
+        chave = chave + "|" + parte
+    return chave
+
+
+def ler_chaves_existentes(engine: Engine, tabela: str, colunas_chave: List[str]) -> set[str]:
+    tabela_sql = limpar_identificador(tabela)
+    existentes = set(colunas_da_tabela(engine, tabela_sql))
+    chaves_validas = [c for c in colunas_chave if c in existentes]
+    if len(chaves_validas) != len(colunas_chave):
+        return set()
+
+    expr = " || '|' || ".join([f"upper(trim(coalesce(\"{c}\", '')))" for c in chaves_validas])
+    query = text(f'SELECT {expr} AS chave FROM "{tabela_sql}"')
+    with engine.connect() as conn:
+        return {str(row[0]) for row in conn.execute(query).all() if row[0] is not None}
+
+
+def filtrar_linhas_novas_banco(
+    df: pd.DataFrame,
+    tabela: str,
+    engine: Engine,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Mantém apenas linhas cuja chave ainda não existe na tabela de destino."""
+    tabela_sql = limpar_identificador(tabela)
+    colunas_chave = CHAVES_UNICAS_BANCO.get(tabela_sql)
+
+    if df.empty or not colunas_chave:
+        return df, {
+            "Chave_Banco": ", ".join(colunas_chave or []),
+            "Linhas_Ja_Existentes_Banco": 0,
+            "Modo_Deduplicacao": "sem_chave_configurada",
+        }
+
+    colunas_disponiveis = set(df.columns)
+    chaves_validas = [c for c in colunas_chave if c in colunas_disponiveis]
+    if len(chaves_validas) != len(colunas_chave):
+        return df, {
+            "Chave_Banco": ", ".join(colunas_chave),
+            "Linhas_Ja_Existentes_Banco": 0,
+            "Modo_Deduplicacao": "chave_nao_encontrada_no_csv",
+        }
+
+    antes = len(df)
+    df = df.copy()
+    df["__chave_banco__"] = chave_linha_banco(df, colunas_chave)
+    df = df.drop_duplicates("__chave_banco__", keep="last")
+    duplicadas_carga = antes - len(df)
+
+    if not tabela_existe(engine, tabela_sql):
+        return df.drop(columns=["__chave_banco__"]), {
+            "Chave_Banco": ", ".join(colunas_chave),
+            "Linhas_Ja_Existentes_Banco": 0,
+            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
+            "Modo_Deduplicacao": "primeira_carga_banco",
+        }
+
+    chaves_existentes = ler_chaves_existentes(engine, tabela_sql, colunas_chave)
+    if not chaves_existentes:
+        return df.drop(columns=["__chave_banco__"]), {
+            "Chave_Banco": ", ".join(colunas_chave),
+            "Linhas_Ja_Existentes_Banco": 0,
+            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
+            "Modo_Deduplicacao": "sem_chaves_existentes_lidas",
+        }
+
+    mascara_novos = ~df["__chave_banco__"].isin(chaves_existentes)
+    novos = df.loc[mascara_novos].drop(columns=["__chave_banco__"])
+    return novos, {
+        "Chave_Banco": ", ".join(colunas_chave),
+        "Linhas_Ja_Existentes_Banco": int((~mascara_novos).sum()),
+        "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
+        "Modo_Deduplicacao": "incremental_somente_novos",
+    }
+
+
 def registrar_log(
     engine: Engine,
     id_carga: str,
@@ -307,17 +483,25 @@ def enviar_dataframe(
     if df.empty and len(df.columns) == 0:
         return 0
     tabela_sql = limpar_identificador(tabela)
-    out = normalizar_colunas_para_sql(df)
-    out = out.astype("string").fillna("")
-    out["id_carga"] = id_carga
-    out["data_hora_carga"] = datetime.now(timezone.utc).isoformat()
-    out["arquivo_origem"] = arquivo_origem
+    out = preparar_dataframe_para_banco(df, id_carga, arquivo_origem)
+
+    if if_exists == "incremental":
+        out, _ = filtrar_linhas_novas_banco(out, tabela_sql, engine)
+        if_exists_sql = "append"
+    else:
+        if_exists_sql = if_exists
+
+    if out.empty:
+        return 0
+
+    if if_exists_sql == "append":
+        garantir_colunas_tabela(engine, tabela_sql, out)
 
     dtype = {col: Text() for col in out.columns}
     out.to_sql(
         tabela_sql,
         engine,
-        if_exists=if_exists,
+        if_exists=if_exists_sql,
         index=False,
         chunksize=1000,
         method="multi",
@@ -335,6 +519,7 @@ def enviar_csv_para_banco(
 ) -> Dict[str, object]:
     caminho = Path(caminho)
     tabela_destino = tabela or ARQUIVOS_PADRAO.get(caminho.name, caminho.stem)
+    tabela_sql = limpar_identificador(tabela_destino)
     id_carga = id_carga or f"carga_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     db = database_name or obter_database_name()
     criar_tabelas_controle(db)
@@ -350,9 +535,47 @@ def enviar_csv_para_banco(
                 "Tabela": tabela_destino,
                 "Linhas_Lidas": 0,
                 "Linhas_Gravadas": 0,
+                "Linhas_Ignoradas": 0,
                 "Mensagem": "Arquivo vazio ou ilegível",
             }
-        gravadas = enviar_dataframe(df, tabela_destino, engine, id_carga, caminho.name, if_exists=if_exists)
+
+        out = preparar_dataframe_para_banco(df, id_carga, caminho.name)
+        meta_incremental: Dict[str, object] = {}
+        if if_exists == "incremental":
+            out, meta_incremental = filtrar_linhas_novas_banco(out, tabela_sql, engine)
+            modo_sql = "append"
+        else:
+            modo_sql = if_exists
+
+        if out.empty:
+            mensagem = "Nenhuma linha nova para gravar"
+            registrar_log(engine, id_carga, caminho.name, tabela_destino, len(df), 0, "IGNORADO", mensagem, if_exists)
+            return {
+                "Status": "IGNORADO",
+                "Arquivo": caminho.name,
+                "Tabela": tabela_destino,
+                "Linhas_Lidas": len(df),
+                "Linhas_Gravadas": 0,
+                "Linhas_Ignoradas": len(df),
+                "Mensagem": mensagem,
+                **meta_incremental,
+            }
+
+        if modo_sql == "append":
+            garantir_colunas_tabela(engine, tabela_sql, out)
+
+        dtype = {col: Text() for col in out.columns}
+        out.to_sql(
+            tabela_sql,
+            engine,
+            if_exists=modo_sql,
+            index=False,
+            chunksize=1000,
+            method="multi",
+            dtype=dtype,
+        )
+        gravadas = len(out)
+        ignoradas = max(len(df) - gravadas, 0) if if_exists == "incremental" else 0
         registrar_log(engine, id_carga, caminho.name, tabela_destino, len(df), gravadas, "OK", "Carga gravada", if_exists)
         return {
             "Status": "OK",
@@ -360,7 +583,9 @@ def enviar_csv_para_banco(
             "Tabela": tabela_destino,
             "Linhas_Lidas": len(df),
             "Linhas_Gravadas": gravadas,
+            "Linhas_Ignoradas": ignoradas,
             "Mensagem": "Carga gravada",
+            **meta_incremental,
         }
     except Exception as exc:
         try:
@@ -373,6 +598,7 @@ def enviar_csv_para_banco(
             "Tabela": tabela_destino,
             "Linhas_Lidas": 0,
             "Linhas_Gravadas": 0,
+            "Linhas_Ignoradas": 0,
             "Mensagem": str(exc),
         }
 
@@ -403,6 +629,29 @@ def enviar_pasta_saida_para_banco(
         resultado["ID_Carga"] = id_carga
         resultados.append(resultado)
     return resultados
+
+
+
+def consultar_resumo_tabelas(database_name: Optional[str] = None, apenas_padrao: bool = True) -> pd.DataFrame:
+    """Retorna quantidade de linhas por tabela oficial do projeto no banco."""
+    db = database_name or obter_database_name()
+    engine = criar_engine(database_name=db)
+    tabelas = sorted(set(ARQUIVOS_PADRAO.values())) if apenas_padrao else None
+
+    if tabelas is None:
+        df_tabelas = listar_tabelas(db)
+        tabelas = df_tabelas["table_name"].astype(str).tolist() if not df_tabelas.empty else []
+
+    linhas = []
+    for tabela in tabelas:
+        tabela_sql = limpar_identificador(tabela)
+        if not tabela_existe(engine, tabela_sql):
+            linhas.append({"Tabela": tabela_sql, "Linhas_Banco": 0, "Status": "Não criada"})
+            continue
+        with engine.connect() as conn:
+            qtd = conn.execute(text(f'SELECT count(*) FROM "{tabela_sql}"')).scalar_one()
+        linhas.append({"Tabela": tabela_sql, "Linhas_Banco": int(qtd or 0), "Status": "OK"})
+    return pd.DataFrame(linhas)
 
 
 def consultar_log_cargas(database_name: Optional[str] = None, limite: int = 100) -> pd.DataFrame:

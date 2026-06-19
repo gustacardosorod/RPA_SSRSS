@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import shutil
 import tempfile
 import time
@@ -25,6 +26,7 @@ from etl_reclamacoes_sap import processar_reclamacoes_sap
 from etl_volume_fila_diario import processar_volume_fila
 from db_cockroach import (
     consultar_log_cargas,
+    consultar_resumo_tabelas,
     enviar_pasta_saida_para_banco,
     listar_tabelas,
     obter_database_name,
@@ -37,6 +39,222 @@ st.set_page_config(
     page_icon="🚌",
     layout="wide",
 )
+
+
+
+def aplicar_estilo() -> None:
+    """Aplica uma camada visual no Streamlit (paleta, cards, métricas, tabs e estados)."""
+    st.markdown(
+        """
+        <style>
+            :root {
+                --azul-900: #0f172a;
+                --azul-800: #1e293b;
+                --azul-700: #1d4ed8;
+                --azul-600: #2563eb;
+                --azul-claro: #38bdf8;
+                --texto-claro: #f8fafc;
+                --texto-suave: #64748b;
+                --borda: #e2e8f0;
+                --sombra: rgba(15, 23, 42, .12);
+                --verde: #16a34a;
+                --verde-bg: #f0fdf4;
+                --amarelo: #d97706;
+                --amarelo-bg: #fffbeb;
+                --vermelho: #dc2626;
+                --vermelho-bg: #fef2f2;
+            }
+
+            .block-container {padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1180px;}
+
+            h1, h2, h3 {color: var(--azul-900);}
+
+            /* ---------- Sidebar ---------- */
+            [data-testid="stSidebar"] {
+                background: linear-gradient(180deg, var(--azul-900) 0%, var(--azul-800) 100%);
+                border-right: 1px solid rgba(255,255,255,.06);
+            }
+            [data-testid="stSidebar"] * {color: var(--texto-claro) !important;}
+            [data-testid="stSidebar"] .stRadio label {
+                font-weight: 600;
+                padding: .35rem .5rem;
+                border-radius: 10px;
+                transition: background .15s ease;
+            }
+            [data-testid="stSidebar"] .stRadio label:hover {background: rgba(255,255,255,.06);}
+            [data-testid="stSidebar"] hr {border-color: rgba(255,255,255,.12);}
+            [data-testid="stSidebar"] code {
+                background: rgba(255,255,255,.08) !important;
+                font-size: .75rem;
+            }
+
+            /* ---------- Hero card ---------- */
+            .hero-card {
+                padding: 1.4rem 1.6rem;
+                border-radius: 22px;
+                background: linear-gradient(135deg, var(--azul-900) 0%, var(--azul-700) 55%, var(--azul-claro) 100%);
+                color: var(--texto-claro);
+                box-shadow: 0 16px 40px var(--sombra);
+                margin-bottom: 1.1rem;
+            }
+            .hero-card h1 {margin: 0; font-size: 1.85rem; line-height: 1.2; color: var(--texto-claro);}
+            .hero-card p {margin: .5rem 0 0 0; opacity: .92; font-size: .98rem;}
+
+            /* ---------- Mini cards (passo a passo) ---------- */
+            .mini-card {
+                border: 1px solid var(--borda);
+                background: #ffffff;
+                border-radius: 18px;
+                padding: 1rem 1.1rem;
+                min-height: 120px;
+                box-shadow: 0 8px 26px rgba(15, 23, 42, .06);
+                transition: transform .15s ease, box-shadow .15s ease;
+            }
+            .mini-card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 12px 30px rgba(15, 23, 42, .10);
+            }
+            .mini-card h3 {margin-top: 0; margin-bottom: .35rem; font-size: 1rem; color: var(--azul-900);}
+            .mini-card p {margin: 0; color: var(--texto-suave); font-size: .9rem; line-height: 1.4;}
+
+            /* ---------- Alerta suave (banner informativo customizado) ---------- */
+            .soft-alert {
+                border-left: 5px solid var(--azul-600);
+                background: #eff6ff;
+                padding: .85rem 1.1rem;
+                border-radius: 12px;
+                color: #1e3a8a;
+                margin: .6rem 0 1.1rem 0;
+                font-size: .93rem;
+                line-height: 1.5;
+            }
+
+            /* ---------- Badges de status (checklist) ---------- */
+            .status-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: .35rem;
+                padding: .2rem .65rem;
+                border-radius: 999px;
+                font-size: .8rem;
+                font-weight: 700;
+            }
+            .status-ok {background: var(--verde-bg); color: var(--verde);}
+            .status-warn {background: var(--amarelo-bg); color: var(--amarelo);}
+            .status-erro {background: var(--vermelho-bg); color: var(--vermelho);}
+
+            /* ---------- Métricas nativas do Streamlit ---------- */
+            div[data-testid="stMetric"] {
+                background: #ffffff;
+                border: 1px solid var(--borda);
+                padding: .85rem 1.1rem;
+                border-radius: 16px;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, .05);
+            }
+            div[data-testid="stMetric"] label {color: var(--texto-suave) !important;}
+            div[data-testid="stMetricValue"] {color: var(--azul-900) !important;}
+
+            /* ---------- Botões ---------- */
+            .stButton > button, .stDownloadButton > button {
+                border-radius: 12px;
+                font-weight: 700;
+                transition: filter .15s ease, transform .1s ease;
+            }
+            .stButton > button:hover, .stDownloadButton > button:hover {
+                filter: brightness(0.95);
+            }
+            .stButton > button:active, .stDownloadButton > button:active {
+                transform: scale(0.98);
+            }
+            .stButton > button[kind="primary"] {
+                background: var(--azul-700);
+                border: none;
+            }
+
+            /* ---------- Tabs ---------- */
+            div[data-testid="stTabs"] div[role="tablist"],
+            .stTabs [data-baseweb="tab-list"] {
+                gap: .5rem;
+                border-bottom: none;
+            }
+
+            div[data-testid="stTabs"] button[role="tab"],
+            .stTabs [data-baseweb="tab"] {
+                border-radius: 999px !important;
+                padding: .55rem .95rem !important;
+                background: #f1f5f9 !important;
+                border: 1px solid var(--borda) !important;
+                font-weight: 700 !important;
+                color: var(--azul-900) !important;
+            }
+
+            div[data-testid="stTabs"] button[role="tab"] p,
+            div[data-testid="stTabs"] button[role="tab"] span,
+            .stTabs [data-baseweb="tab"] p,
+            .stTabs [data-baseweb="tab"] span {
+                color: var(--azul-900) !important;
+                font-weight: 700 !important;
+            }
+
+            div[data-testid="stTabs"] button[role="tab"][aria-selected="true"],
+            .stTabs [data-baseweb="tab"][aria-selected="true"] {
+                background: var(--azul-700) !important;
+                border-color: var(--azul-700) !important;
+                color: var(--texto-claro) !important;
+            }
+
+            div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p,
+            div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] span,
+            .stTabs [data-baseweb="tab"][aria-selected="true"] p,
+            .stTabs [data-baseweb="tab"][aria-selected="true"] span {
+                color: var(--texto-claro) !important;
+                font-weight: 700 !important;
+            }
+
+            div[data-testid="stTabs"] div[data-baseweb="tab-highlight"] {
+                background-color: transparent !important;
+            }
+
+            /* ---------- Inputs, selects, expanders ---------- */
+            .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
+                border-radius: 10px !important;
+            }
+            details[data-testid="stExpander"] {
+                border: 1px solid var(--borda);
+                border-radius: 14px;
+                box-shadow: 0 4px 14px rgba(15, 23, 42, .04);
+            }
+            details[data-testid="stExpander"] summary {font-weight: 600; color: var(--azul-900);}
+
+            /* ---------- Alertas nativos (success/info/warning/error) ---------- */
+            div[data-testid="stNotificationContentSuccess"],
+            div[data-testid="stNotificationContentInfo"],
+            div[data-testid="stNotificationContentWarning"],
+            div[data-testid="stNotificationContentError"] {
+                border-radius: 12px;
+            }
+
+            /* ---------- Dataframes ---------- */
+            div[data-testid="stDataFrame"] {
+                border: 1px solid var(--borda);
+                border-radius: 14px;
+                overflow: hidden;
+            }
+
+            /* ---------- Barra de progresso ---------- */
+            div[data-testid="stProgress"] div[role="progressbar"] > div {
+                background: linear-gradient(90deg, var(--azul-700), var(--azul-claro));
+            }
+
+            /* ---------- Divider mais discreto ---------- */
+            hr {margin: 1.1rem 0;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+aplicar_estilo()
 
 TIPOS_CARGA = {
     "Contact Center SSRS": "entrada",
@@ -84,6 +302,34 @@ MODOS = {
 }
 
 
+
+def card_html(titulo: str, texto: str, emoji: str = "📌") -> str:
+    return f"""
+    <div class="mini-card">
+        <h3>{emoji} {titulo}</h3>
+        <p>{texto}</p>
+    </div>
+    """
+
+
+def status_badge_html(status: str) -> str:
+    """Converte o status textual do checklist em um badge colorido."""
+    if "Gerado" in status:
+        classe, rotulo = "status-ok", "✅ Gerado"
+    elif "Vazio" in status:
+        classe, rotulo = "status-warn", "⚠️ Vazio"
+    else:
+        classe, rotulo = "status-erro", "❌ Faltando"
+    return f'<span class="status-badge {classe}">{rotulo}</span>'
+
+
+def numero_br(valor) -> str:
+    try:
+        return f"{int(valor):,}".replace(",", ".")
+    except Exception:
+        return str(valor)
+
+
 def init_session() -> None:
     if "workspace" not in st.session_state:
         raiz = Path(tempfile.gettempdir()) / f"rpa_ssrs_streamlit_{int(time.time())}"
@@ -122,6 +368,54 @@ def limpar_nome_arquivo(nome: str) -> str:
     return nome.strip() or f"arquivo_{int(time.time())}"
 
 
+def caminho_relativo_seguro(caminho: Path, base: Path) -> str:
+    """Retorna caminho relativo sem quebrar quando o Windows alterna nome longo/8.3.
+
+    Exemplo do drama: C:\\Users\\GustavoCardoso e C:\\Users\\GUSTAV~1 podem apontar
+    para o mesmo lugar, mas Path.relative_to() compara texto puro e explode.
+    """
+    caminho = Path(caminho)
+    base = Path(base)
+
+    for c, b in ((caminho, base), (caminho.resolve(), base.resolve())):
+        try:
+            return str(c.relative_to(b))
+        except ValueError:
+            continue
+
+    try:
+        rel = os.path.relpath(str(caminho.resolve()), str(base.resolve()))
+        if rel and not rel.startswith("..") and not os.path.isabs(rel):
+            return rel
+    except Exception:
+        pass
+
+    return caminho.name
+
+
+def caminho_dentro_da_pasta(caminho: Path, base: Path) -> bool:
+    """Confirma que o caminho final permanece dentro da pasta base."""
+    caminho_resolvido = Path(caminho).resolve()
+    base_resolvida = Path(base).resolve()
+
+    try:
+        caminho_resolvido.relative_to(base_resolvida)
+        return True
+    except ValueError:
+        pass
+
+    try:
+        comum = os.path.commonpath(
+            [
+                os.path.normcase(str(caminho_resolvido)),
+                os.path.normcase(str(base_resolvida)),
+            ]
+        )
+        return comum == os.path.normcase(str(base_resolvida))
+    except Exception:
+        return False
+
+
 def salvar_upload(uploaded_file, destino: Path) -> Path:
     destino.mkdir(parents=True, exist_ok=True)
     caminho = destino / limpar_nome_arquivo(uploaded_file.name)
@@ -130,29 +424,45 @@ def salvar_upload(uploaded_file, destino: Path) -> Path:
 
 
 def safe_extract_zip(zip_bytes: bytes, destino: Path) -> List[str]:
+    """Extrai ZIP com proteção contra path traversal e sem erro de relative_to no Windows."""
+    destino = Path(destino).resolve()
     destino.mkdir(parents=True, exist_ok=True)
+
     extraidos: List[str] = []
+
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for member in zf.infolist():
             if member.is_dir():
                 continue
-            nome = member.filename.replace("\\", "/")
-            partes = [p for p in nome.split("/") if p and p not in {".", ".."}]
-            if not partes:
+
+            nome = member.filename.replace("\\", "/").lstrip("/")
+            partes = [p for p in nome.split("/") if p and p != "."]
+
+            # Evita ZIP malicioso tentando gravar fora do workspace.
+            if not partes or any(p == ".." for p in partes):
                 continue
+
             caminho_destino = destino.joinpath(*partes).resolve()
-            if not str(caminho_destino).startswith(str(destino.resolve())):
+
+            if not caminho_dentro_da_pasta(caminho_destino, destino):
                 continue
+
             caminho_destino.parent.mkdir(parents=True, exist_ok=True)
-            caminho_destino.write_bytes(zf.read(member))
-            extraidos.append(str(caminho_destino.relative_to(destino)))
+
+            with zf.open(member) as origem, open(caminho_destino, "wb") as saida:
+                shutil.copyfileobj(origem, saida)
+
+            # Não use relative_to() aqui. No Windows, resolve() pode expandir GUSTAV~1
+            # para GustavoCardoso e causar ValueError, mesmo estando no mesmo diretório.
+            extraidos.append(str(Path(*partes)))
+
     return extraidos
 
-
 def listar_arquivos_relativos(pasta: Path) -> List[str]:
+    pasta = Path(pasta).resolve()
     if not pasta.exists():
         return []
-    return sorted(str(p.relative_to(pasta)) for p in pasta.rglob("*") if p.is_file())
+    return sorted(caminho_relativo_seguro(p, pasta) for p in pasta.rglob("*") if p.is_file())
 
 
 def csv_tem_conteudo(caminho: Path) -> bool:
@@ -235,7 +545,8 @@ def zipar_pasta_saida() -> bytes:
                 continue
             for arquivo in pasta.rglob("*"):
                 if arquivo.is_file():
-                    zf.write(arquivo, arcname=f"{chave}/{arquivo.relative_to(pasta)}")
+                    rel = caminho_relativo_seguro(arquivo, pasta).replace("\\", "/")
+                    zf.write(arquivo, arcname=f"{chave}/{rel}")
     return buffer.getvalue()
 
 
@@ -352,11 +663,25 @@ def mostrar_checklist_relatorios(expandido: bool = True) -> None:
     total = len(checklist)
     gerados = int(checklist["Status"].astype(str).str.contains("Gerado").sum()) if not checklist.empty else 0
     faltando = total - gerados
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Esperados", total)
     c2.metric("Gerados", gerados)
     c3.metric("Faltando/vazios", faltando)
-    st.dataframe(checklist, use_container_width=True, hide_index=True)
+
+    if total:
+        st.progress(gerados / total, text=f"{gerados} de {total} relatórios prontos")
+
+    st.dataframe(
+        checklist,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Status": st.column_config.TextColumn("Status", width="small"),
+            "Arquivo": st.column_config.TextColumn("Arquivo", width="medium"),
+            "Descrição": st.column_config.TextColumn("Descrição", width="large"),
+        },
+    )
     if faltando:
         st.warning("Há relatório obrigatório faltando ou vazio. Rode a carga correspondente ou envie os arquivos de entrada corretos.")
     else:
@@ -364,29 +689,38 @@ def mostrar_checklist_relatorios(expandido: bool = True) -> None:
 
 
 def tela_inicio() -> None:
-    st.title("🚌 RPA SSRS + SAP + GOV Chamados")
-    st.caption(f"Versão: {VERSAO_APP}")
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <h1>🚌 RPA SSRS + SAP + GOV Chamados</h1>
+            <p>Tratamento de relatórios, geração das bases finais e envio incremental para o CockroachDB. Versão {VERSAO_APP}.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(card_html("1. Importar", "Suba ZIP completo ou arquivos separados por tipo de carga.", "📤"), unsafe_allow_html=True)
+    with c2:
+        st.markdown(card_html("2. Processar", "Rode o ETL online e gere CSVs tratados na pasta de saída.", "⚙️"), unsafe_allow_html=True)
+    with c3:
+        st.markdown(card_html("3. Validar", "Confira checklist, prévia das bases e logs de processamento.", "📊"), unsafe_allow_html=True)
+    with c4:
+        st.markdown(card_html("4. Banco", "Envie somente registros novos para o CockroachDB.", "🗄️"), unsafe_allow_html=True)
 
     st.markdown(
         """
-Este app executa os tratamentos do projeto RPA em uma interface online:
-
-- Contact Center SSRS: Agent, CSS, Volume/Fila e Indicadores Gerais.
-- SAP Service / FSR.
-- Reclamações SAP.
-- GOV Chamados.
-- Exportação em CSV, Excel e ZIP com logs.
-
-A parte online processa arquivos enviados pelo usuário. Extração automática de sistemas internos, tipo SSRS em rede `10.x.x.x` ou Power Automate Desktop, continua dependendo de máquina/VM dentro da rede. Streamlit Cloud não é médium corporativo, infelizmente.
-        """
+        <div class="soft-alert">
+            Fluxo recomendado: importe os arquivos, processe em modo incremental, valide o checklist e envie ao banco em <b>Incremental inteligente</b>.
+            O Streamlit processa o que você sobe. Ele não invade SSRS interno nem roda Power Automate Desktop na nuvem, porque ainda não chegamos nesse nível de feitiçaria corporativa.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     mostrar_kpis_saida()
     mostrar_checklist_relatorios(expandido=True)
-
-    st.info(
-        "Fluxo recomendado: envie um ZIP com a estrutura completa do projeto ou suba os arquivos por tipo de carga, depois vá em ⚙️ Processar ETL."
-    )
 
 
 def tela_importar() -> None:
@@ -432,8 +766,8 @@ def tela_importar() -> None:
 
     if uploads and st.button("Salvar arquivos enviados"):
         salvos = [salvar_upload(arq, destino) for arq in uploads]
-        st.success(f"{len(salvos)} arquivo(s) salvo(s) em {destino.relative_to(ps['base'])}.")
-        st.write([str(p.relative_to(ps["base"])) for p in salvos])
+        st.success(f"{len(salvos)} arquivo(s) salvo(s) em {caminho_relativo_seguro(destino, ps['base'])}.")
+        st.write([caminho_relativo_seguro(p, ps["base"]) for p in salvos])
 
     st.divider()
     st.subheader("Arquivos atualmente na sessão")
@@ -639,120 +973,158 @@ def tela_logs() -> None:
 
 
 def tela_banco_cockroach() -> None:
-    st.header("🗄️ Banco CockroachDB")
-
     st.markdown(
         """
-Esta tela conecta o app ao **CockroachDB Cloud** para guardar o histórico das cargas tratadas.
-
-Fluxo correto:
-
-```text
-Streamlit processa os arquivos
-        ↓
-Gera CSVs na pasta saida
-        ↓
-Envia os CSVs para o CockroachDB
-        ↓
-Power BI pode consumir o banco depois
-```
-
-O banco fica no CockroachDB, não dentro do Streamlit. O Streamlit só conecta e grava, porque ele tem amor-próprio suficiente para não fingir que é servidor de banco.
-        """
+        <div class="hero-card">
+            <h1>🗄️ Banco CockroachDB</h1>
+            <p>Central de conexão, envio incremental e auditoria das cargas tratadas.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with st.expander("1) Como configurar o CockroachDB no Streamlit Cloud", expanded=True):
-        st.markdown(
-            """
-1. Crie um cluster no CockroachDB Cloud.
-2. No cluster, clique em **Connect**.
-3. Copie a conexão no formato PostgreSQL.
-4. No Streamlit Cloud, entre em **Manage app → Settings → Secrets**.
-5. Cole o bloco abaixo, trocando usuário, senha e host.
-            """
-        )
-        st.code(
-            '''[cockroachdb]
-database_url = "postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
-database_name = "rpa_ssrs"''',
-            language="toml",
-        )
-        st.warning("Nunca coloque senha no código nem no GitHub. O GitHub não esquece, ele apenas espera sua carreira passar vergonha.")
-
-    st.divider()
-    st.subheader("Conexão")
     nome_db = st.text_input("Nome do database do projeto", value=obter_database_name("rpa_ssrs"))
 
-    col1, col2, col3 = st.columns(3)
+    tab_conexao, tab_envio, tab_monitoramento = st.tabs([
+        "🔌 Conexão",
+        "🚀 Envio incremental",
+        "📈 Monitoramento",
+    ])
 
-    with col1:
-        if st.button("Testar conexão", type="primary"):
+    with tab_conexao:
+        st.markdown(
+            """
+            <div class="soft-alert">
+                Configure o segredo do Streamlit Cloud em <b>Manage app → Settings → Secrets</b>. Senha no código é crime contra a própria semana.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.code(
+            """[cockroachdb]
+database_url = "postgresql://USUARIO:SENHA@HOST:26257/defaultdb?sslmode=verify-full"
+database_name = "rpa_ssrs""",
+            language="toml",
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("Testar conexão", type="primary", use_container_width=True):
+                try:
+                    info = testar_conexao()
+                    st.success("Conexão OK com o cluster.")
+                    st.json(info)
+                except Exception as exc:
+                    st.error(f"Falha na conexão: {exc}")
+        with col2:
+            if st.button("Criar database/controles", use_container_width=True):
+                try:
+                    db = preparar_database(nome_db)
+                    st.success(f"Database `{db}` pronto com tabelas de controle.")
+                except Exception as exc:
+                    st.error(f"Erro ao preparar database: {exc}")
+        with col3:
+            if st.button("Listar tabelas", use_container_width=True):
+                try:
+                    df_tabs = listar_tabelas(nome_db)
+                    st.dataframe(df_tabs, use_container_width=True, hide_index=True)
+                except Exception as exc:
+                    st.error(f"Erro ao listar tabelas: {exc}")
+
+    with tab_envio:
+        st.subheader("Enviar CSVs tratados para o banco")
+        st.caption("O modo recomendado compara as chaves no banco e grava somente registros novos. Revolucionário: não duplicar dados.")
+
+        checklist = verificar_relatorios_obrigatorios()
+        gerados = int(checklist["Status"].astype(str).str.contains("Gerado").sum()) if not checklist.empty else 0
+        faltando = len(checklist) - gerados
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Relatórios gerados", gerados)
+        c2.metric("Pendentes/vazios", faltando)
+        c3.metric("Arquivos oficiais", len(checklist))
+
+        with st.expander("Ver checklist antes do envio", expanded=faltando > 0):
+            st.dataframe(checklist, use_container_width=True, hide_index=True)
+
+        apenas_padrao = st.checkbox("Enviar apenas relatórios oficiais do projeto", value=True)
+        modo_label = st.radio(
+            "Modo de gravação no banco",
+            [
+                "Incremental inteligente - somente novos",
+                "Append bruto - empilha tudo",
+                "Replace - apaga e recria",
+            ],
+            horizontal=True,
+            index=0,
+        )
+        modo_envio = {
+            "Incremental inteligente - somente novos": "incremental",
+            "Append bruto - empilha tudo": "append",
+            "Replace - apaga e recria": "replace",
+        }[modo_label]
+
+        if modo_envio == "incremental":
+            st.success("Recomendado: lê as chaves já existentes no CockroachDB e envia apenas linhas novas.")
+        elif modo_envio == "append":
+            st.warning("Append bruto pode duplicar histórico. Útil só quando você tem certeza, o que estatisticamente é raro.")
+        else:
+            st.error("Replace apaga e recria a tabela destino. Use só para correção pesada ou teste controlado.")
+
+        if st.button("Enviar para CockroachDB", type="primary", use_container_width=True):
             try:
-                info = testar_conexao()
-                st.success("Conexão OK com o cluster.")
-                st.json(info)
-            except Exception as exc:
-                st.error(f"Falha na conexão: {exc}")
+                resultados = enviar_pasta_saida_para_banco(
+                    pastas()["saida"],
+                    database_name=nome_db,
+                    apenas_padrao=apenas_padrao,
+                    if_exists=modo_envio,
+                )
+                if resultados:
+                    df_res = pd.DataFrame(resultados)
+                    linhas_lidas = pd.to_numeric(df_res.get("Linhas_Lidas", 0), errors="coerce").fillna(0).sum()
+                    linhas_gravadas = pd.to_numeric(df_res.get("Linhas_Gravadas", 0), errors="coerce").fillna(0).sum()
+                    linhas_ignoradas = pd.to_numeric(df_res.get("Linhas_Ignoradas", 0), errors="coerce").fillna(0).sum()
 
-    with col2:
-        if st.button("Criar database e tabelas de controle"):
+                    st.success("Envio finalizado.")
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Arquivos avaliados", len(df_res))
+                    k2.metric("Linhas lidas", numero_br(linhas_lidas))
+                    k3.metric("Linhas gravadas", numero_br(linhas_gravadas))
+                    k4.metric("Ignoradas", numero_br(linhas_ignoradas))
+                    st.dataframe(df_res, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Nenhum CSV encontrado para enviar. Rode o ETL antes, essa etapa chata chamada gerar dados.")
+            except Exception as exc:
+                st.error(f"Erro ao enviar dados para o CockroachDB: {exc}")
+
+    with tab_monitoramento:
+        st.subheader("Resumo das tabelas no banco")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("Atualizar resumo das tabelas", type="primary", use_container_width=True):
+                try:
+                    df_resumo = consultar_resumo_tabelas(nome_db, apenas_padrao=True)
+                    st.session_state.resumo_banco = df_resumo
+                except Exception as exc:
+                    st.error(f"Erro ao consultar resumo: {exc}")
+        with col2:
+            limite = st.number_input("Limite de registros do log", min_value=10, max_value=1000, value=100, step=10)
+
+        if "resumo_banco" in st.session_state:
+            df_resumo = st.session_state.resumo_banco
+            if not df_resumo.empty:
+                total_banco = pd.to_numeric(df_resumo["Linhas_Banco"], errors="coerce").fillna(0).sum()
+                st.metric("Total de linhas nas tabelas oficiais", numero_br(total_banco))
+            st.dataframe(df_resumo, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Histórico de cargas")
+        if st.button("Consultar log_cargas", use_container_width=True):
             try:
-                db = preparar_database(nome_db)
-                st.success(f"Database `{db}` pronto com tabelas de controle.")
+                df_log = consultar_log_cargas(nome_db, limite=int(limite))
+                st.dataframe(df_log, use_container_width=True, hide_index=True)
             except Exception as exc:
-                st.error(f"Erro ao preparar database: {exc}")
+                st.error(f"Erro ao consultar histórico: {exc}")
 
-    with col3:
-        if st.button("Listar tabelas"):
-            try:
-                df_tabs = listar_tabelas(nome_db)
-                st.dataframe(df_tabs, use_container_width=True, hide_index=True)
-            except Exception as exc:
-                st.error(f"Erro ao listar tabelas: {exc}")
-
-    st.divider()
-    st.subheader("Enviar cargas tratadas para o banco")
-    st.caption("Primeiro rode o ETL. Depois envie os CSVs da pasta `saida` para o CockroachDB.")
-
-    checklist = verificar_relatorios_obrigatorios()
-    st.dataframe(checklist, use_container_width=True, hide_index=True)
-
-    apenas_padrao = st.checkbox("Enviar apenas relatórios oficiais do projeto", value=True)
-    modo_envio = st.selectbox(
-        "Modo de gravação no banco",
-        ["append", "replace"],
-        index=0,
-        help="append guarda histórico de cargas. replace recria a tabela, use só em teste ou correção pesada.",
-    )
-
-    if modo_envio == "replace":
-        st.warning("Modo replace apaga e recria a tabela destino. Sim, é aquele botão que parece útil até alguém perguntar cadê o histórico.")
-
-    if st.button("Enviar saídas para CockroachDB", type="primary"):
-        try:
-            resultados = enviar_pasta_saida_para_banco(
-                pastas()["saida"],
-                database_name=nome_db,
-                apenas_padrao=apenas_padrao,
-                if_exists=modo_envio,
-            )
-            if resultados:
-                st.success("Envio finalizado.")
-                st.dataframe(pd.DataFrame(resultados), use_container_width=True, hide_index=True)
-            else:
-                st.warning("Nenhum CSV encontrado para enviar. Rode o ETL antes, essa pequena superstição chamada processamento.")
-        except Exception as exc:
-            st.error(f"Erro ao enviar dados para o CockroachDB: {exc}")
-
-    st.divider()
-    st.subheader("Histórico de cargas no banco")
-    limite = st.number_input("Limite de registros", min_value=10, max_value=1000, value=100, step=10)
-    if st.button("Consultar log_cargas"):
-        try:
-            df_log = consultar_log_cargas(nome_db, limite=int(limite))
-            st.dataframe(df_log, use_container_width=True, hide_index=True)
-        except Exception as exc:
-            st.error(f"Erro ao consultar histórico: {exc}")
 
 def tela_sobre() -> None:
     st.header("ℹ️ Sobre o projeto e deploy")
@@ -848,7 +1220,10 @@ database_name = "rpa_ssrs"
 init_session()
 
 with st.sidebar:
-    st.title("Menu")
+    st.title("🚌 RPA Hub")
+    st.caption(f"Tratamento, validação e banco · {VERSAO_APP.split('_')[0]}")
+    st.divider()
+
     pagina = st.radio(
         "Navegação",
         [
@@ -861,11 +1236,12 @@ with st.sidebar:
             "🗄️ Banco CockroachDB",
             "ℹ️ Sobre o projeto",
         ],
+        label_visibility="collapsed",
     )
 
     st.divider()
-    st.caption("Workspace temporário")
-    st.code(str(Path(st.session_state.workspace)))
+    with st.expander("📁 Workspace temporário"):
+        st.code(str(Path(st.session_state.workspace)), language="text")
 
 if pagina == "🏠 Início":
     tela_inicio()
