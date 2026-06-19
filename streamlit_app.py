@@ -713,7 +713,6 @@ def tela_inicio() -> None:
         """
         <div class="soft-alert">
             Fluxo recomendado: importe os arquivos, processe em modo incremental, valide o checklist e envie ao banco em <b>Incremental inteligente</b>.
-            O Streamlit processa o que você sobe. Ele não invade SSRS interno nem roda Power Automate Desktop na nuvem, porque ainda não chegamos nesse nível de feitiçaria corporativa.
         </div>
         """,
         unsafe_allow_html=True,
