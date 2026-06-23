@@ -11,7 +11,7 @@ from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.types import Text
 from dotenv import load_dotenv
@@ -26,10 +26,21 @@ except Exception:  # pragma: no cover - uso local sem Streamlit
 ARQUIVOS_PADRAO: Dict[str, str] = {
     "dim_atendentes.csv": "dim_atendentes",
     "f_agent_contact_diario.csv": "f_agent_contact_diario",
+    "f_agent_contact_fila_diario.csv": "f_agent_contact_fila_diario",
+    "f_gente_contact_diario.csv": "f_gente_contact_diario",
+    "f_gente_contact_fila_diario.csv": "f_gente_contact_fila_diario",
     "f_css_atendente.csv": "f_css_atendente",
+    "f_css_detalhado.csv": "f_css_detalhado",
+    "f_css_periodo_atendente.csv": "f_css_periodo_atendente",
+    "f_css_periodo_geral.csv": "f_css_periodo_geral",
+    "f_css_fila_detalhado_diario.csv": "f_css_fila_detalhado_diario",
+    "f_css_fila_diario.csv": "f_css_fila_diario",
     "f_css_geral_diario.csv": "f_css_geral_diario",
     "f_fsr_tratado.csv": "f_fsr_tratado",
     "f_indicadores_gerais.csv": "f_indicadores_gerais",
+    "f_indicadores_gerais_periodo.csv": "f_indicadores_gerais_periodo",
+    "f_indicadores_agentes_diario.csv": "f_indicadores_agentes_diario",
+    "f_indicadores_agentes_periodo.csv": "f_indicadores_agentes_periodo",
     "f_reclamacoes_sap_tratado.csv": "f_reclamacoes_sap_tratado",
     "f_volume_fila_diario.csv": "f_volume_fila_diario",
     "f_volume_geral_diario.csv": "f_volume_geral_diario",
@@ -46,10 +57,21 @@ ARQUIVOS_PADRAO: Dict[str, str] = {
 CHAVES_UNICAS_BANCO: Dict[str, List[str]] = {
     "dim_atendentes": ["atendente_id"],
     "f_agent_contact_diario": ["data", "atendente_id", "grupo"],
-    "f_css_atendente": ["periodo_inicio", "periodo_fim", "atendente_id"],
+    "f_agent_contact_fila_diario": ["data", "atendente_id", "grupo", "fila"],
+    "f_gente_contact_diario": ["data", "atendente_id", "grupo"],
+    "f_gente_contact_fila_diario": ["data", "atendente_id", "grupo", "fila"],
+    "f_css_atendente": ["data", "periodo_inicio", "periodo_fim", "atendente_id"],
+    "f_css_detalhado": ["data", "periodo_inicio", "periodo_fim", "atendente_id", "script", "pergunta", "resposta"],
+    "f_css_periodo_atendente": ["periodo_inicio", "periodo_fim", "atendente_id"],
+    "f_css_periodo_geral": ["periodo_inicio", "periodo_fim"],
+    "f_css_fila_detalhado_diario": ["data", "fila", "script", "pergunta", "resposta"],
+    "f_css_fila_diario": ["data", "fila"],
     "f_css_geral_diario": ["data"],
     "f_fsr_tratado": ["chave_fsr"],
     "f_indicadores_gerais": ["data"],
+    "f_indicadores_gerais_periodo": ["periodo_inicio", "periodo_fim"],
+    "f_indicadores_agentes_diario": ["data", "atendente_id", "grupo"],
+    "f_indicadores_agentes_periodo": ["periodo_inicio", "periodo_fim", "atendente_id"],
     "f_reclamacoes_sap_tratado": ["chave_sap"],
     "f_volume_fila_diario": ["data", "fila"],
     "f_volume_geral_diario": ["data"],
@@ -139,7 +161,9 @@ def normalizar_url_sqlalchemy(url: str) -> str:
     # Se estiver usando verify-full, aponta para o certificado baixado
     if "sslmode=verify-full" in url and "sslrootcert=" not in url:
         separador = "&" if "?" in url else "?"
-        url = f"{url}{separador}sslrootcert=C:/Users/GustavoCardoso/AppData/Roaming/postgresql/root.crt"
+        root_cert = os.getenv("COCKROACH_SSLROOTCERT")
+        if root_cert:
+            url = f"{url}{separador}sslrootcert={root_cert}"
 
     return url
 
@@ -378,6 +402,85 @@ def ler_chaves_existentes(engine: Engine, tabela: str, colunas_chave: List[str])
         return {str(row[0]) for row in conn.execute(query).all() if row[0] is not None}
 
 
+
+
+def preparar_upsert_por_chave_banco(
+    df: pd.DataFrame,
+    tabela: str,
+    engine: Engine,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Prepara carga segura para banco existente: remove no banco as chaves que virão no CSV e depois faz append.
+
+    Isso preserva o histórico que já está no banco e atualiza somente as chaves presentes na nova saída do ETL.
+    É o modo mais indicado quando o Power BI já consome uma base existente e o SSRS substitui arquivos diariamente.
+    """
+    tabela_sql = limpar_identificador(tabela)
+    colunas_chave = CHAVES_UNICAS_BANCO.get(tabela_sql)
+
+    if df.empty or not colunas_chave:
+        return df, {
+            "Chave_Banco": ", ".join(colunas_chave or []),
+            "Linhas_Substituidas_Banco": 0,
+            "Duplicidades_Removidas_Na_Carga": 0,
+            "Modo_Deduplicacao": "upsert_sem_chave_configurada",
+        }
+
+    colunas_disponiveis = set(df.columns)
+    if any(c not in colunas_disponiveis for c in colunas_chave):
+        return df, {
+            "Chave_Banco": ", ".join(colunas_chave),
+            "Linhas_Substituidas_Banco": 0,
+            "Duplicidades_Removidas_Na_Carga": 0,
+            "Modo_Deduplicacao": "upsert_chave_nao_encontrada_no_csv",
+        }
+
+    antes = len(df)
+    out = df.copy()
+    out["__chave_banco__"] = chave_linha_banco(out, colunas_chave)
+    out = out.drop_duplicates("__chave_banco__", keep="last")
+    chaves = sorted(set(out["__chave_banco__"].dropna().astype(str)))
+    out = out.drop(columns=["__chave_banco__"])
+    duplicadas_carga = antes - len(out)
+
+    if not tabela_existe(engine, tabela_sql):
+        return out, {
+            "Chave_Banco": ", ".join(colunas_chave),
+            "Linhas_Substituidas_Banco": 0,
+            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
+            "Modo_Deduplicacao": "upsert_primeira_carga_banco",
+        }
+
+    existentes = set(colunas_da_tabela(engine, tabela_sql))
+    if any(c not in existentes for c in colunas_chave):
+        return out, {
+            "Chave_Banco": ", ".join(colunas_chave),
+            "Linhas_Substituidas_Banco": 0,
+            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
+            "Modo_Deduplicacao": "upsert_chave_nao_encontrada_na_tabela_existente",
+        }
+
+    garantir_colunas_tabela(engine, tabela_sql, out)
+    expr = " || '|' || ".join([f"upper(trim(coalesce(\"{c}\", '')))" for c in colunas_chave])
+    total_removido = 0
+    tamanho_chunk = 500
+    with engine.begin() as conn:
+        for i in range(0, len(chaves), tamanho_chunk):
+            parte = chaves[i:i + tamanho_chunk]
+            if not parte:
+                continue
+            stmt = text(f'DELETE FROM "{tabela_sql}" WHERE ({expr}) IN :chaves').bindparams(
+                bindparam("chaves", expanding=True)
+            )
+            res = conn.execute(stmt, {"chaves": parte})
+            if res.rowcount and res.rowcount > 0:
+                total_removido += int(res.rowcount)
+
+    return out, {
+        "Chave_Banco": ", ".join(colunas_chave),
+        "Linhas_Substituidas_Banco": total_removido,
+        "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
+        "Modo_Deduplicacao": "upsert_delete_append_por_chave",
+    }
 def filtrar_linhas_novas_banco(
     df: pd.DataFrame,
     tabela: str,
@@ -488,6 +591,9 @@ def enviar_dataframe(
     if if_exists == "incremental":
         out, _ = filtrar_linhas_novas_banco(out, tabela_sql, engine)
         if_exists_sql = "append"
+    elif if_exists == "upsert":
+        out, _ = preparar_upsert_por_chave_banco(out, tabela_sql, engine)
+        if_exists_sql = "append"
     else:
         if_exists_sql = if_exists
 
@@ -543,6 +649,9 @@ def enviar_csv_para_banco(
         meta_incremental: Dict[str, object] = {}
         if if_exists == "incremental":
             out, meta_incremental = filtrar_linhas_novas_banco(out, tabela_sql, engine)
+            modo_sql = "append"
+        elif if_exists == "upsert":
+            out, meta_incremental = preparar_upsert_por_chave_banco(out, tabela_sql, engine)
             modo_sql = "append"
         else:
             modo_sql = if_exists
