@@ -7,12 +7,10 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
-
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 from sqlalchemy import create_engine, text, bindparam
-from sqlalchemy.engine import Engine, URL, make_url
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.types import Text
 from dotenv import load_dotenv
 
@@ -121,45 +119,16 @@ def obter_database_name(default: str = "rpa_ssrs") -> str:
     return limpar_identificador(nome, max_len=60)
 
 
-def normalizar_url_sqlalchemy(url: str) -> str:
-    """Converte URL do CockroachDB Cloud para o dialeto correto do SQLAlchemy."""
-
-    url = str(url or "").strip().strip('"').strip("'")
-
-    # Remove prefixos colados por engano
-    if url.startswith("DATABASE_URL="):
-        url = url.replace("DATABASE_URL=", "", 1).strip()
-
-    if url.startswith("COCKROACH_DATABASE_URL="):
-        url = url.replace("COCKROACH_DATABASE_URL=", "", 1).strip()
-
-    # Remove quebras de linha e espaços acidentais
-    url = "".join(url.split())
-
-    # A string do painel vem como postgresql://, mas no SQLAlchemy precisa usar cockroachdb
-    if url.startswith("postgresql://"):
-        url = "cockroachdb+psycopg://" + url[len("postgresql://"):]
-
-    elif url.startswith("postgres://"):
-        url = "cockroachdb+psycopg://" + url[len("postgres://"):]
-
-    elif url.startswith("postgresql+psycopg://"):
-        url = "cockroachdb+psycopg://" + url[len("postgresql+psycopg://"):]
-
-    elif url.startswith("cockroachdb://"):
-        url = "cockroachdb+psycopg://" + url[len("cockroachdb://"):]
-
-    elif url.startswith("cockroachdb+psycopg://"):
-        pass
-
-    else:
-        raise ValueError(
-            "URL inválida. Use uma URL começando com postgresql://, postgres://, "
-            "cockroachdb:// ou cockroachdb+psycopg://"
-        )
 
 def normalizar_url_sqlalchemy(url: str) -> str:
-    """Converte URL do CockroachDB Cloud para o dialeto correto do SQLAlchemy."""
+    """Converte a URL do CockroachDB Cloud para o dialeto correto do SQLAlchemy.
+
+    Também corrige o uso do certificado SSL:
+    - troca postgresql:// por cockroachdb+psycopg://;
+    - remove prefixos colados por engano, como DATABASE_URL=;
+    - força sslrootcert para o arquivo certs/root.crt quando sslmode=verify-full;
+    - evita que o app continue usando sslrootcert=system quando existe certificado no projeto.
+    """
 
     url = str(url or "").strip().strip('"').strip("'")
 
@@ -169,6 +138,7 @@ def normalizar_url_sqlalchemy(url: str) -> str:
     if url.startswith("COCKROACH_DATABASE_URL="):
         url = url.replace("COCKROACH_DATABASE_URL=", "", 1).strip()
 
+    # Remove quebras de linha e espaços acidentais, comuns quando a URL é colada no secret.
     url = "".join(url.split())
 
     if url.startswith("postgresql://"):
@@ -189,16 +159,55 @@ def normalizar_url_sqlalchemy(url: str) -> str:
     else:
         raise ValueError(
             "URL inválida. Use uma URL começando com postgresql://, postgres://, "
-            "cockroachdb:// ou cockroachdb+psycopg://"
+            "postgresql+psycopg://, cockroachdb:// ou cockroachdb+psycopg://."
         )
 
-    # Correção do erro do root.crt
-    if "sslmode=verify-full" in url and "sslrootcert=" not in url:
-        separador = "&" if "?" in url else "?"
-        root_cert = os.getenv("COCKROACH_SSLROOTCERT", "system")
-        url = f"{url}{separador}sslrootcert={root_cert}"
+    url_obj = make_url(url)
+    query = dict(url_obj.query)
 
-    return url
+    sslmode = str(query.get("sslmode") or "").strip().lower()
+
+    # CockroachDB Cloud deve usar SSL. Se a URL não trouxer sslmode, assumimos verify-full.
+    if not sslmode:
+        sslmode = "verify-full"
+        query["sslmode"] = sslmode
+
+    if sslmode == "verify-full":
+        base_dir = Path(__file__).resolve().parent
+        cert_padrao = base_dir / "certs" / "root.crt"
+
+        root_cert_configurado = (
+            _get_secret_value("cockroachdb", "sslrootcert")
+            or os.getenv("COCKROACH_SSLROOTCERT")
+            or query.get("sslrootcert")
+        )
+
+        root_cert_final: Optional[Path] = None
+
+        # Se o usuário configurou um caminho real, respeita esse caminho.
+        # Se configurou "system", ignora quando houver certs/root.crt no projeto,
+        # porque foi exatamente o que já falhou no Streamlit.
+        if root_cert_configurado and str(root_cert_configurado).lower() != "system":
+            candidato = Path(str(root_cert_configurado))
+            if not candidato.is_absolute():
+                candidato = base_dir / candidato
+            root_cert_final = candidato
+
+        elif cert_padrao.exists():
+            root_cert_final = cert_padrao
+
+        if root_cert_final is None or not root_cert_final.exists():
+            raise RuntimeError(
+                "Certificado SSL do CockroachDB não encontrado. "
+                f"Esperado em: {cert_padrao}. "
+                "Baixe o CA Cert do CockroachDB e salve como certs/root.crt no projeto, "
+                "ou configure cockroachdb.sslrootcert apontando para um arquivo existente."
+            )
+
+        query["sslrootcert"] = str(root_cert_final)
+
+    url_obj = url_obj.set(query=query)
+    return url_obj.render_as_string(hide_password=False)
 
 
 def limpar_identificador(nome: str, max_len: int = 63) -> str:
@@ -514,6 +523,8 @@ def preparar_upsert_por_chave_banco(
         "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
         "Modo_Deduplicacao": "upsert_delete_append_por_chave",
     }
+
+
 def filtrar_linhas_novas_banco(
     df: pd.DataFrame,
     tabela: str,
