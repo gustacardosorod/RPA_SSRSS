@@ -158,12 +158,45 @@ def normalizar_url_sqlalchemy(url: str) -> str:
             "cockroachdb:// ou cockroachdb+psycopg://"
         )
 
-    # Se estiver usando verify-full, aponta para o certificado baixado
+def normalizar_url_sqlalchemy(url: str) -> str:
+    """Converte URL do CockroachDB Cloud para o dialeto correto do SQLAlchemy."""
+
+    url = str(url or "").strip().strip('"').strip("'")
+
+    if url.startswith("DATABASE_URL="):
+        url = url.replace("DATABASE_URL=", "", 1).strip()
+
+    if url.startswith("COCKROACH_DATABASE_URL="):
+        url = url.replace("COCKROACH_DATABASE_URL=", "", 1).strip()
+
+    url = "".join(url.split())
+
+    if url.startswith("postgresql://"):
+        url = "cockroachdb+psycopg://" + url[len("postgresql://"):]
+
+    elif url.startswith("postgres://"):
+        url = "cockroachdb+psycopg://" + url[len("postgres://"):]
+
+    elif url.startswith("postgresql+psycopg://"):
+        url = "cockroachdb+psycopg://" + url[len("postgresql+psycopg://"):]
+
+    elif url.startswith("cockroachdb://"):
+        url = "cockroachdb+psycopg://" + url[len("cockroachdb://"):]
+
+    elif url.startswith("cockroachdb+psycopg://"):
+        pass
+
+    else:
+        raise ValueError(
+            "URL inválida. Use uma URL começando com postgresql://, postgres://, "
+            "cockroachdb:// ou cockroachdb+psycopg://"
+        )
+
+    # Correção do erro do root.crt
     if "sslmode=verify-full" in url and "sslrootcert=" not in url:
         separador = "&" if "?" in url else "?"
-        root_cert = os.getenv("COCKROACH_SSLROOTCERT")
-        if root_cert:
-            url = f"{url}{separador}sslrootcert={root_cert}"
+        root_cert = os.getenv("COCKROACH_SSLROOTCERT", "system")
+        url = f"{url}{separador}sslrootcert={root_cert}"
 
     return url
 
