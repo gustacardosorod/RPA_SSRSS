@@ -1,0 +1,24 @@
+{
+  "pasta": "C:\\RPA_SSRSS_REPO\\entrada\\29_06_2026",
+  "gerado_em": "2026-06-30T08:46:20",
+  "arquivos": [
+    {
+      "nome": "Agent - Contact Handling Time 4 - Daily_2.csv",
+      "tamanho_bytes": 1164852,
+      "sha256": "d0c10c0bb0da6a9073db8f5d44da5443f3a6962b4a97cbd4c03ad4f126c043ed",
+      "modificado_em": "2026-06-29T05:00:09"
+    },
+    {
+      "nome": "Script Result 3 - Queue Volume per Day_2.csv",
+      "tamanho_bytes": 111004,
+      "sha256": "fb499bab9b5074e9e62079a4fedb0e9bd4196830cb0a73dc042d38e739d9ae16",
+      "modificado_em": "2026-06-29T05:00:09"
+    },
+    {
+      "nome": "Volume 4 - Daily.csv",
+      "tamanho_bytes": 248443,
+      "sha256": "07d836c3ef58e9e23de5e5c2c169ba33c4bbb8a8434dd3283da2d03200f1feff",
+      "modificado_em": "2026-06-29T05:00:16"
+    }
+  ]
+}

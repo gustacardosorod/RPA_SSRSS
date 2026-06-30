@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import time
 import uuid
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 from sqlalchemy import create_engine, text, bindparam
@@ -17,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 try:
     import streamlit as st
-except Exception:  # pragma: no cover - uso local sem Streamlit
+except Exception:  # pragma: no cover
     st = None
 
 
@@ -49,9 +52,8 @@ ARQUIVOS_PADRAO: Dict[str, str] = {
     "dim_categorias_chamados.csv": "dim_categorias_chamados",
 }
 
-# Chaves usadas no envio incremental para o banco.
-# Os nomes abaixo já estão no padrão SQL, ou seja, minúsculos e sem acento.
-# Sem isso, o banco vira um depósito de duplicidade com iluminação ruim.
+# Chaves oficiais para cargas seguras. Se faltar chave, a carga falha.
+# Banco que aceita chave ausente é basicamente uma lixeira com endpoint.
 CHAVES_UNICAS_BANCO: Dict[str, List[str]] = {
     "dim_atendentes": ["atendente_id"],
     "f_agent_contact_diario": ["data", "atendente_id", "grupo"],
@@ -82,7 +84,6 @@ CHAVES_UNICAS_BANCO: Dict[str, List[str]] = {
 
 
 def _get_secret_value(secao: str, chave: str) -> Optional[str]:
-    """Lê secrets do Streamlit sem quebrar execução local."""
     if st is None:
         return None
     try:
@@ -93,125 +94,7 @@ def _get_secret_value(secao: str, chave: str) -> Optional[str]:
         return None
 
 
-def obter_database_url() -> str:
-    """Obtém a URL do CockroachDB por Streamlit Secrets ou variável de ambiente.
-
-    Prioridade:
-    1. st.secrets["cockroachdb"]["database_url"]
-    2. COCKROACH_DATABASE_URL
-    3. DATABASE_URL
-    """
-    url = (
-        _get_secret_value("cockroachdb", "database_url")
-        or os.getenv("COCKROACH_DATABASE_URL")
-        or os.getenv("DATABASE_URL")
-    )
-    if not url:
-        raise RuntimeError(
-            "Conexão do CockroachDB não configurada. Configure st.secrets['cockroachdb']['database_url'] "
-            "no Streamlit Cloud ou a variável de ambiente COCKROACH_DATABASE_URL."
-        )
-    return normalizar_url_sqlalchemy(url)
-
-
-def obter_database_name(default: str = "rpa_ssrs") -> str:
-    nome = _get_secret_value("cockroachdb", "database_name") or os.getenv("COCKROACH_DATABASE_NAME") or default
-    return limpar_identificador(nome, max_len=60)
-
-
-
-def normalizar_url_sqlalchemy(url: str) -> str:
-    """Converte a URL do CockroachDB Cloud para o dialeto correto do SQLAlchemy.
-
-    Também corrige o uso do certificado SSL:
-    - troca postgresql:// por cockroachdb+psycopg://;
-    - remove prefixos colados por engano, como DATABASE_URL=;
-    - força sslrootcert para o arquivo certs/root.crt quando sslmode=verify-full;
-    - evita que o app continue usando sslrootcert=system quando existe certificado no projeto.
-    """
-
-    url = str(url or "").strip().strip('"').strip("'")
-
-    if url.startswith("DATABASE_URL="):
-        url = url.replace("DATABASE_URL=", "", 1).strip()
-
-    if url.startswith("COCKROACH_DATABASE_URL="):
-        url = url.replace("COCKROACH_DATABASE_URL=", "", 1).strip()
-
-    # Remove quebras de linha e espaços acidentais, comuns quando a URL é colada no secret.
-    url = "".join(url.split())
-
-    if url.startswith("postgresql://"):
-        url = "cockroachdb+psycopg://" + url[len("postgresql://"):]
-
-    elif url.startswith("postgres://"):
-        url = "cockroachdb+psycopg://" + url[len("postgres://"):]
-
-    elif url.startswith("postgresql+psycopg://"):
-        url = "cockroachdb+psycopg://" + url[len("postgresql+psycopg://"):]
-
-    elif url.startswith("cockroachdb://"):
-        url = "cockroachdb+psycopg://" + url[len("cockroachdb://"):]
-
-    elif url.startswith("cockroachdb+psycopg://"):
-        pass
-
-    else:
-        raise ValueError(
-            "URL inválida. Use uma URL começando com postgresql://, postgres://, "
-            "postgresql+psycopg://, cockroachdb:// ou cockroachdb+psycopg://."
-        )
-
-    url_obj = make_url(url)
-    query = dict(url_obj.query)
-
-    sslmode = str(query.get("sslmode") or "").strip().lower()
-
-    # CockroachDB Cloud deve usar SSL. Se a URL não trouxer sslmode, assumimos verify-full.
-    if not sslmode:
-        sslmode = "verify-full"
-        query["sslmode"] = sslmode
-
-    if sslmode == "verify-full":
-        base_dir = Path(__file__).resolve().parent
-        cert_padrao = base_dir / "certs" / "root.crt"
-
-        root_cert_configurado = (
-            _get_secret_value("cockroachdb", "sslrootcert")
-            or os.getenv("COCKROACH_SSLROOTCERT")
-            or query.get("sslrootcert")
-        )
-
-        root_cert_final: Optional[Path] = None
-
-        # Se o usuário configurou um caminho real, respeita esse caminho.
-        # Se configurou "system", ignora quando houver certs/root.crt no projeto,
-        # porque foi exatamente o que já falhou no Streamlit.
-        if root_cert_configurado and str(root_cert_configurado).lower() != "system":
-            candidato = Path(str(root_cert_configurado))
-            if not candidato.is_absolute():
-                candidato = base_dir / candidato
-            root_cert_final = candidato
-
-        elif cert_padrao.exists():
-            root_cert_final = cert_padrao
-
-        if root_cert_final is None or not root_cert_final.exists():
-            raise RuntimeError(
-                "Certificado SSL do CockroachDB não encontrado. "
-                f"Esperado em: {cert_padrao}. "
-                "Baixe o CA Cert do CockroachDB e salve como certs/root.crt no projeto, "
-                "ou configure cockroachdb.sslrootcert apontando para um arquivo existente."
-            )
-
-        query["sslrootcert"] = str(root_cert_final)
-
-    url_obj = url_obj.set(query=query)
-    return url_obj.render_as_string(hide_password=False)
-
-
 def limpar_identificador(nome: str, max_len: int = 63) -> str:
-    """Cria nomes seguros para tabelas/colunas no SQL."""
     nome = str(nome or "").strip().lower()
     nome = unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
     nome = re.sub(r"[^a-z0-9_]+", "_", nome)
@@ -221,6 +104,10 @@ def limpar_identificador(nome: str, max_len: int = 63) -> str:
     if nome[0].isdigit():
         nome = f"c_{nome}"
     return nome[:max_len]
+
+
+def quote_ident(nome: str) -> str:
+    return '"' + limpar_identificador(nome).replace('"', '""') + '"'
 
 
 def normalizar_colunas_para_sql(df: pd.DataFrame) -> pd.DataFrame:
@@ -236,17 +123,86 @@ def normalizar_colunas_para_sql(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def obter_database_url() -> str:
+    url = (
+        _get_secret_value("cockroachdb", "database_url")
+        or os.getenv("COCKROACH_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+    )
+    if not url:
+        raise RuntimeError(
+            "Conexão do CockroachDB não configurada. Configure st.secrets['cockroachdb']['database_url'] "
+            "ou COCKROACH_DATABASE_URL."
+        )
+    return normalizar_url_sqlalchemy(url)
+
+
+def obter_database_name(default: str = "rpa_ssrs") -> str:
+    nome = _get_secret_value("cockroachdb", "database_name") or os.getenv("COCKROACH_DATABASE_NAME") or default
+    return limpar_identificador(nome, max_len=60)
+
+
+def normalizar_url_sqlalchemy(url: str) -> str:
+    url = str(url or "").strip().strip('"').strip("'")
+    for prefixo in ["DATABASE_URL=", "COCKROACH_DATABASE_URL="]:
+        if url.startswith(prefixo):
+            url = url.replace(prefixo, "", 1).strip()
+    url = "".join(url.split())
+
+    if url.startswith("postgresql://"):
+        url = "cockroachdb+psycopg://" + url[len("postgresql://"):]
+    elif url.startswith("postgres://"):
+        url = "cockroachdb+psycopg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql+psycopg://"):
+        url = "cockroachdb+psycopg://" + url[len("postgresql+psycopg://"):]
+    elif url.startswith("cockroachdb://"):
+        url = "cockroachdb+psycopg://" + url[len("cockroachdb://"):]
+    elif not url.startswith("cockroachdb+psycopg://"):
+        raise ValueError("URL inválida para CockroachDB/PostgreSQL.")
+
+    url_obj = make_url(url)
+    query = dict(url_obj.query)
+    sslmode = str(query.get("sslmode") or "").strip().lower()
+    if not sslmode:
+        sslmode = "verify-full"
+        query["sslmode"] = sslmode
+
+    if sslmode == "verify-full":
+        base_dir = Path(__file__).resolve().parent
+        cert_padrao = base_dir / "certs" / "root.crt"
+        root_cert_configurado = (
+            _get_secret_value("cockroachdb", "sslrootcert")
+            or os.getenv("COCKROACH_SSLROOTCERT")
+            or query.get("sslrootcert")
+        )
+        root_cert_final: Optional[Path] = None
+        if root_cert_configurado and str(root_cert_configurado).lower() != "system":
+            candidato = Path(str(root_cert_configurado))
+            if not candidato.is_absolute():
+                candidato = base_dir / candidato
+            root_cert_final = candidato
+        elif cert_padrao.exists():
+            root_cert_final = cert_padrao
+        if root_cert_final is None or not root_cert_final.exists():
+            raise RuntimeError(
+                f"Certificado SSL do CockroachDB não encontrado. Esperado em {cert_padrao} "
+                "ou configure COCKROACH_SSLROOTCERT."
+            )
+        query["sslrootcert"] = str(root_cert_final)
+
+    return url_obj.set(query=query).render_as_string(hide_password=False)
+
+
 def criar_engine(database_name: Optional[str] = None) -> Engine:
-    url_original = obter_database_url()
-    url = make_url(url_original)
+    url = make_url(obter_database_url())
     if database_name:
         url = url.set(database=database_name)
     return create_engine(url, pool_pre_ping=True, future=True)
 
 
-def url_para_database(database_name: str) -> str:
-    url = make_url(obter_database_url())
-    return str(url.set(database=database_name))
+def criar_engine_defaultdb() -> Engine:
+    url = make_url(obter_database_url()).set(database="defaultdb")
+    return create_engine(url, pool_pre_ping=True, future=True)
 
 
 def testar_conexao(database_name: Optional[str] = None) -> Dict[str, str]:
@@ -259,11 +215,10 @@ def testar_conexao(database_name: Optional[str] = None) -> Dict[str, str]:
 
 
 def criar_database(database_name: Optional[str] = None) -> str:
-    """Cria o database do projeto no cluster, se ainda não existir."""
     nome = limpar_identificador(database_name or obter_database_name())
-    engine = criar_engine(database_name=None)
+    engine = criar_engine_defaultdb()
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(f'CREATE DATABASE IF NOT EXISTS "{nome}"'))
+        conn.execute(text(f'CREATE DATABASE IF NOT EXISTS {quote_ident(nome)}'))
     return nome
 
 
@@ -294,6 +249,27 @@ def criar_tabelas_controle(database_name: Optional[str] = None) -> None:
         linhas_gravadas INT8 NULL,
         PRIMARY KEY (id_carga, tabela_destino, arquivo_origem)
     );
+
+    CREATE TABLE IF NOT EXISTS controle_execucao_etl (
+        id_execucao STRING PRIMARY KEY,
+        data_hora_inicio TIMESTAMPTZ NOT NULL DEFAULT now(),
+        data_hora_fim TIMESTAMPTZ NULL,
+        status STRING NOT NULL,
+        origem STRING NULL,
+        modo_carga STRING NULL,
+        mensagem STRING NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS auditoria_cargas (
+        id_carga STRING NOT NULL,
+        tabela_destino STRING NOT NULL,
+        regra STRING NOT NULL,
+        severidade STRING NOT NULL,
+        mensagem STRING NULL,
+        valor_referencia STRING NULL,
+        data_hora_auditoria TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (id_carga, tabela_destino, regra)
+    );
     """
     with engine.begin() as conn:
         for comando in [c.strip() for c in ddl.split(";") if c.strip()]:
@@ -310,10 +286,15 @@ def arquivo_tem_conteudo(caminho: Path) -> bool:
     caminho = Path(caminho)
     if not caminho.exists() or caminho.stat().st_size == 0:
         return False
-    try:
-        return bool(caminho.read_bytes()[:4096].strip())
-    except Exception:
-        return False
+    return bool(caminho.read_bytes()[:4096].strip())
+
+
+def calcular_sha256(caminho: Path, bloco: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with Path(caminho).open("rb") as f:
+        for pedaco in iter(lambda: f.read(bloco), b""):
+            h.update(pedaco)
+    return h.hexdigest()
 
 
 def ler_csv_seguro(caminho: Path) -> pd.DataFrame:
@@ -331,9 +312,10 @@ def ler_csv_seguro(caminho: Path) -> pd.DataFrame:
                     encoding=encoding,
                     dtype=str,
                     engine="python",
-                    on_bad_lines="skip",
+                    on_bad_lines="error",
                 )
-                candidatos.append((len(df.columns), len(df), df))
+                if len(df.columns) >= 1:
+                    candidatos.append((len(df.columns), len(df), df))
             except EmptyDataError:
                 return pd.DataFrame()
             except (UnicodeDecodeError, ParserError, ValueError, OSError) as exc:
@@ -346,13 +328,12 @@ def ler_csv_seguro(caminho: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-
 def preparar_dataframe_para_banco(
     df: pd.DataFrame,
     id_carga: str,
     arquivo_origem: str,
+    hash_arquivo: str = "",
 ) -> pd.DataFrame:
-    """Normaliza colunas e adiciona metadados técnicos antes da gravação."""
     if df.empty and len(df.columns) == 0:
         return pd.DataFrame()
     out = normalizar_colunas_para_sql(df)
@@ -360,6 +341,7 @@ def preparar_dataframe_para_banco(
     out["id_carga"] = id_carga
     out["data_hora_carga"] = datetime.now(timezone.utc).isoformat()
     out["arquivo_origem"] = arquivo_origem
+    out["hash_arquivo"] = hash_arquivo
     return out
 
 
@@ -379,7 +361,6 @@ def tabela_existe(engine: Engine, tabela: str) -> bool:
 
 
 def colunas_da_tabela(engine: Engine, tabela: str) -> List[str]:
-    tabela_sql = limpar_identificador(tabela)
     query = text(
         """
         SELECT column_name
@@ -390,40 +371,48 @@ def colunas_da_tabela(engine: Engine, tabela: str) -> List[str]:
         """
     )
     with engine.connect() as conn:
-        return [str(row[0]) for row in conn.execute(query, {"tabela": tabela_sql}).all()]
+        return [str(row[0]) for row in conn.execute(query, {"tabela": limpar_identificador(tabela)}).all()]
+
+
+def primary_key_da_tabela(engine: Engine, tabela: str) -> List[str]:
+    query = text(
+        """
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        WHERE tc.table_schema = 'public'
+          AND tc.table_name = :tabela
+          AND tc.constraint_type = 'PRIMARY KEY'
+        ORDER BY kcu.ordinal_position
+        """
+    )
+    with engine.connect() as conn:
+        return [str(row[0]) for row in conn.execute(query, {"tabela": limpar_identificador(tabela)}).all()]
 
 
 def garantir_colunas_tabela(engine: Engine, tabela: str, df: pd.DataFrame) -> None:
-    """Adiciona colunas novas no banco antes do append.
-
-    Isso evita erro quando o ETL passa a gerar uma coluna nova. Porque claro,
-    até coluna resolve nascer depois da reunião de homologação.
-    """
-    if df.empty:
+    if df.empty or not tabela_existe(engine, tabela):
         return
-    tabela_sql = limpar_identificador(tabela)
-    if not tabela_existe(engine, tabela_sql):
-        return
-    existentes = set(colunas_da_tabela(engine, tabela_sql))
-    faltantes = [col for col in df.columns if col not in existentes]
+    existentes = set(colunas_da_tabela(engine, tabela))
+    faltantes = [limpar_identificador(c) for c in df.columns if limpar_identificador(c) not in existentes]
     if not faltantes:
         return
     with engine.begin() as conn:
         for col in faltantes:
-            col_sql = limpar_identificador(col)
-            conn.execute(text(f'ALTER TABLE "{tabela_sql}" ADD COLUMN IF NOT EXISTS "{col_sql}" STRING'))
+            conn.execute(text(f'ALTER TABLE {quote_ident(tabela)} ADD COLUMN IF NOT EXISTS {quote_ident(col)} STRING'))
 
 
 def chave_linha_banco(df: pd.DataFrame, colunas_chave: List[str]) -> pd.Series:
-    """Gera chave normalizada para comparação entre CSV tratado e banco."""
     if df is None or df.empty:
         return pd.Series(dtype=str)
     partes = []
     for col in colunas_chave:
         if col not in df.columns:
-            serie = pd.Series([""] * len(df), index=df.index, dtype="string")
-        else:
-            serie = df[col].fillna("").astype(str).str.strip().str.upper()
+            raise ValueError(f"Coluna de chave ausente: {col}")
+        serie = df[col].fillna("").astype(str).str.strip().str.upper()
         partes.append(serie)
     chave = partes[0]
     for parte in partes[1:]:
@@ -431,154 +420,111 @@ def chave_linha_banco(df: pd.DataFrame, colunas_chave: List[str]) -> pd.Series:
     return chave
 
 
-def ler_chaves_existentes(engine: Engine, tabela: str, colunas_chave: List[str]) -> set[str]:
+def validar_chaves_para_carga(df: pd.DataFrame, tabela: str) -> List[str]:
     tabela_sql = limpar_identificador(tabela)
-    existentes = set(colunas_da_tabela(engine, tabela_sql))
-    chaves_validas = [c for c in colunas_chave if c in existentes]
-    if len(chaves_validas) != len(colunas_chave):
-        return set()
+    chaves = CHAVES_UNICAS_BANCO.get(tabela_sql)
+    if not chaves:
+        raise ValueError(f"Tabela {tabela_sql} não tem chave configurada para upsert/incremental.")
+    faltantes = [c for c in chaves if c not in df.columns]
+    if faltantes:
+        raise ValueError(f"Tabela {tabela_sql}: chave(s) ausente(s) no CSV tratado: {faltantes}")
+    chave = chave_linha_banco(df, chaves)
+    vazias = chave.astype(str).str.replace("|", "", regex=False).str.strip().eq("")
+    if vazias.any():
+        raise ValueError(f"Tabela {tabela_sql}: {int(vazias.sum())} linha(s) com chave vazia.")
+    duplicadas = chave.duplicated(keep=False)
+    if duplicadas.any():
+        exemplos = chave.loc[duplicadas].head(10).tolist()
+        raise ValueError(f"Tabela {tabela_sql}: duplicidade na carga para chave {chaves}. Exemplos: {exemplos}")
+    return chaves
 
-    expr = " || '|' || ".join([f"upper(trim(coalesce(\"{c}\", '')))" for c in chaves_validas])
-    query = text(f'SELECT {expr} AS chave FROM "{tabela_sql}"')
+
+def garantir_tabela_final_com_pk(engine: Engine, tabela: str, df: pd.DataFrame, colunas_chave: List[str]) -> None:
+    tabela_sql = limpar_identificador(tabela)
+    colunas = [limpar_identificador(c) for c in df.columns]
+    chaves = [limpar_identificador(c) for c in colunas_chave]
+    if not tabela_existe(engine, tabela_sql):
+        defs = []
+        for col in colunas:
+            nulo = "NOT NULL" if col in chaves else "NULL"
+            defs.append(f'{quote_ident(col)} STRING {nulo}')
+        pk = ", ".join(quote_ident(c) for c in chaves)
+        ddl = f'CREATE TABLE IF NOT EXISTS {quote_ident(tabela_sql)} (\n  ' + ",\n  ".join(defs) + f",\n  PRIMARY KEY ({pk})\n)"
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return
+
+    pk_atual = primary_key_da_tabela(engine, tabela_sql)
+    if [c.lower() for c in pk_atual] != chaves:
+        raise RuntimeError(
+            f"Tabela {tabela_sql} existe com primary key {pk_atual or 'nenhuma'}, mas a carga exige {chaves}. "
+            "Pare a carga e rode a migração SQL de chaves primárias antes de continuar. "
+            "Sim, é chato; mais chato é duplicidade no fechamento mensal."
+        )
+    garantir_colunas_tabela(engine, tabela_sql, df)
+
+
+def ler_chaves_existentes(engine: Engine, tabela: str, colunas_chave: List[str]) -> set[str]:
+    if not tabela_existe(engine, tabela):
+        return set()
+    existentes = set(colunas_da_tabela(engine, tabela))
+    if any(c not in existentes for c in colunas_chave):
+        raise ValueError(f"Tabela {tabela}: chave não existe no banco: {colunas_chave}")
+    expr = " || '|' || ".join([f"upper(trim(coalesce({quote_ident(c)}, '')))" for c in colunas_chave])
+    query = text(f'SELECT {expr} AS chave FROM {quote_ident(tabela)}')
     with engine.connect() as conn:
         return {str(row[0]) for row in conn.execute(query).all() if row[0] is not None}
 
 
+def executar_com_retry(func, tentativas: int = 3):
+    for tentativa in range(1, tentativas + 1):
+        try:
+            return func()
+        except Exception as exc:
+            msg = str(exc).lower()
+            retry = "40001" in msg or "restart transaction" in msg or "serialization" in msg
+            if not retry or tentativa >= tentativas:
+                raise
+            time.sleep(min(2 ** tentativa, 10))
 
 
-def preparar_upsert_por_chave_banco(
-    df: pd.DataFrame,
-    tabela: str,
-    engine: Engine,
-) -> Tuple[pd.DataFrame, Dict[str, object]]:
-    """Prepara carga segura para banco existente: remove no banco as chaves que virão no CSV e depois faz append.
-
-    Isso preserva o histórico que já está no banco e atualiza somente as chaves presentes na nova saída do ETL.
-    É o modo mais indicado quando o Power BI já consome uma base existente e o SSRS substitui arquivos diariamente.
-    """
+def gravar_upsert_com_staging(df: pd.DataFrame, tabela: str, engine: Engine) -> int:
     tabela_sql = limpar_identificador(tabela)
-    colunas_chave = CHAVES_UNICAS_BANCO.get(tabela_sql)
+    chaves = validar_chaves_para_carga(df, tabela_sql)
+    garantir_tabela_final_com_pk(engine, tabela_sql, df, chaves)
+    colunas = [limpar_identificador(c) for c in df.columns]
+    staging = limpar_identificador(f"stg_{tabela_sql}_{uuid.uuid4().hex[:10]}")
+    dtype = {col: Text() for col in df.columns}
 
-    if df.empty or not colunas_chave:
-        return df, {
-            "Chave_Banco": ", ".join(colunas_chave or []),
-            "Linhas_Substituidas_Banco": 0,
-            "Duplicidades_Removidas_Na_Carga": 0,
-            "Modo_Deduplicacao": "upsert_sem_chave_configurada",
-        }
+    def _rodar():
+        with engine.begin() as conn:
+            conn.execute(text(f'DROP TABLE IF EXISTS {quote_ident(staging)}'))
+            df.to_sql(staging, conn, if_exists="replace", index=False, chunksize=1000, method="multi", dtype=dtype)
+            lista_colunas = ", ".join(quote_ident(c) for c in colunas)
+            select_colunas = ", ".join(quote_ident(c) for c in colunas)
+            conn.execute(text(f'UPSERT INTO {quote_ident(tabela_sql)} ({lista_colunas}) SELECT {select_colunas} FROM {quote_ident(staging)}'))
+            conn.execute(text(f'DROP TABLE IF EXISTS {quote_ident(staging)}'))
+        return len(df)
 
-    colunas_disponiveis = set(df.columns)
-    if any(c not in colunas_disponiveis for c in colunas_chave):
-        return df, {
-            "Chave_Banco": ", ".join(colunas_chave),
-            "Linhas_Substituidas_Banco": 0,
-            "Duplicidades_Removidas_Na_Carga": 0,
-            "Modo_Deduplicacao": "upsert_chave_nao_encontrada_no_csv",
-        }
-
-    antes = len(df)
-    out = df.copy()
-    out["__chave_banco__"] = chave_linha_banco(out, colunas_chave)
-    out = out.drop_duplicates("__chave_banco__", keep="last")
-    chaves = sorted(set(out["__chave_banco__"].dropna().astype(str)))
-    out = out.drop(columns=["__chave_banco__"])
-    duplicadas_carga = antes - len(out)
-
-    if not tabela_existe(engine, tabela_sql):
-        return out, {
-            "Chave_Banco": ", ".join(colunas_chave),
-            "Linhas_Substituidas_Banco": 0,
-            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
-            "Modo_Deduplicacao": "upsert_primeira_carga_banco",
-        }
-
-    existentes = set(colunas_da_tabela(engine, tabela_sql))
-    if any(c not in existentes for c in colunas_chave):
-        return out, {
-            "Chave_Banco": ", ".join(colunas_chave),
-            "Linhas_Substituidas_Banco": 0,
-            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
-            "Modo_Deduplicacao": "upsert_chave_nao_encontrada_na_tabela_existente",
-        }
-
-    garantir_colunas_tabela(engine, tabela_sql, out)
-    expr = " || '|' || ".join([f"upper(trim(coalesce(\"{c}\", '')))" for c in colunas_chave])
-    total_removido = 0
-    tamanho_chunk = 500
-    with engine.begin() as conn:
-        for i in range(0, len(chaves), tamanho_chunk):
-            parte = chaves[i:i + tamanho_chunk]
-            if not parte:
-                continue
-            stmt = text(f'DELETE FROM "{tabela_sql}" WHERE ({expr}) IN :chaves').bindparams(
-                bindparam("chaves", expanding=True)
-            )
-            res = conn.execute(stmt, {"chaves": parte})
-            if res.rowcount and res.rowcount > 0:
-                total_removido += int(res.rowcount)
-
-    return out, {
-        "Chave_Banco": ", ".join(colunas_chave),
-        "Linhas_Substituidas_Banco": total_removido,
-        "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
-        "Modo_Deduplicacao": "upsert_delete_append_por_chave",
-    }
+    return int(executar_com_retry(_rodar))
 
 
-def filtrar_linhas_novas_banco(
-    df: pd.DataFrame,
-    tabela: str,
-    engine: Engine,
-) -> Tuple[pd.DataFrame, Dict[str, object]]:
-    """Mantém apenas linhas cuja chave ainda não existe na tabela de destino."""
+def filtrar_linhas_novas_banco(df: pd.DataFrame, tabela: str, engine: Engine) -> Tuple[pd.DataFrame, Dict[str, object]]:
     tabela_sql = limpar_identificador(tabela)
-    colunas_chave = CHAVES_UNICAS_BANCO.get(tabela_sql)
-
-    if df.empty or not colunas_chave:
-        return df, {
-            "Chave_Banco": ", ".join(colunas_chave or []),
-            "Linhas_Ja_Existentes_Banco": 0,
-            "Modo_Deduplicacao": "sem_chave_configurada",
-        }
-
-    colunas_disponiveis = set(df.columns)
-    chaves_validas = [c for c in colunas_chave if c in colunas_disponiveis]
-    if len(chaves_validas) != len(colunas_chave):
-        return df, {
-            "Chave_Banco": ", ".join(colunas_chave),
-            "Linhas_Ja_Existentes_Banco": 0,
-            "Modo_Deduplicacao": "chave_nao_encontrada_no_csv",
-        }
-
-    antes = len(df)
-    df = df.copy()
-    df["__chave_banco__"] = chave_linha_banco(df, colunas_chave)
-    df = df.drop_duplicates("__chave_banco__", keep="last")
-    duplicadas_carga = antes - len(df)
-
+    colunas_chave = validar_chaves_para_carga(df, tabela_sql)
     if not tabela_existe(engine, tabela_sql):
-        return df.drop(columns=["__chave_banco__"]), {
+        return df, {
             "Chave_Banco": ", ".join(colunas_chave),
             "Linhas_Ja_Existentes_Banco": 0,
-            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
             "Modo_Deduplicacao": "primeira_carga_banco",
         }
-
     chaves_existentes = ler_chaves_existentes(engine, tabela_sql, colunas_chave)
-    if not chaves_existentes:
-        return df.drop(columns=["__chave_banco__"]), {
-            "Chave_Banco": ", ".join(colunas_chave),
-            "Linhas_Ja_Existentes_Banco": 0,
-            "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
-            "Modo_Deduplicacao": "sem_chaves_existentes_lidas",
-        }
-
-    mascara_novos = ~df["__chave_banco__"].isin(chaves_existentes)
-    novos = df.loc[mascara_novos].drop(columns=["__chave_banco__"])
+    chave_novo = chave_linha_banco(df, colunas_chave)
+    mascara_novos = ~chave_novo.isin(chaves_existentes)
+    novos = df.loc[mascara_novos].copy()
     return novos, {
         "Chave_Banco": ", ".join(colunas_chave),
         "Linhas_Ja_Existentes_Banco": int((~mascara_novos).sum()),
-        "Duplicidades_Removidas_Na_Carga": duplicadas_carga,
         "Modo_Deduplicacao": "incremental_somente_novos",
     }
 
@@ -619,6 +565,27 @@ def registrar_log(
         )
 
 
+def registrar_controle_carga(engine: Engine, id_carga: str, caminho: Path, tabela: str, hash_arquivo: str, linhas: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPSERT INTO controle_cargas
+                (id_carga, data_hora_carga, tabela_destino, arquivo_origem, tamanho_bytes, hash_arquivo, linhas_gravadas)
+                VALUES (:id_carga, now(), :tabela, :arquivo, :tamanho, :hash, :linhas)
+                """
+            ),
+            {
+                "id_carga": id_carga,
+                "tabela": tabela,
+                "arquivo": Path(caminho).name,
+                "tamanho": int(Path(caminho).stat().st_size) if Path(caminho).exists() else 0,
+                "hash": hash_arquivo,
+                "linhas": int(linhas or 0),
+            },
+        )
+
+
 def enviar_dataframe(
     df: pd.DataFrame,
     tabela: str,
@@ -626,37 +593,34 @@ def enviar_dataframe(
     id_carga: str,
     arquivo_origem: str,
     if_exists: str = "append",
+    hash_arquivo: str = "",
 ) -> int:
     if df.empty and len(df.columns) == 0:
         return 0
     tabela_sql = limpar_identificador(tabela)
-    out = preparar_dataframe_para_banco(df, id_carga, arquivo_origem)
+    out = preparar_dataframe_para_banco(df, id_carga, arquivo_origem, hash_arquivo=hash_arquivo)
+
+    if if_exists == "upsert":
+        return gravar_upsert_com_staging(out, tabela_sql, engine)
 
     if if_exists == "incremental":
         out, _ = filtrar_linhas_novas_banco(out, tabela_sql, engine)
-        if_exists_sql = "append"
-    elif if_exists == "upsert":
-        out, _ = preparar_upsert_por_chave_banco(out, tabela_sql, engine)
+        if out.empty:
+            return 0
+        if not tabela_existe(engine, tabela_sql):
+            chaves = CHAVES_UNICAS_BANCO.get(tabela_sql)
+            if chaves:
+                garantir_tabela_final_com_pk(engine, tabela_sql, out, chaves)
+        else:
+            garantir_colunas_tabela(engine, tabela_sql, out)
         if_exists_sql = "append"
     else:
         if_exists_sql = if_exists
-
-    if out.empty:
-        return 0
-
-    if if_exists_sql == "append":
-        garantir_colunas_tabela(engine, tabela_sql, out)
+        if if_exists_sql == "append":
+            garantir_colunas_tabela(engine, tabela_sql, out)
 
     dtype = {col: Text() for col in out.columns}
-    out.to_sql(
-        tabela_sql,
-        engine,
-        if_exists=if_exists_sql,
-        index=False,
-        chunksize=1000,
-        method="multi",
-        dtype=dtype,
-    )
+    out.to_sql(tabela_sql, engine, if_exists=if_exists_sql, index=False, chunksize=1000, method="multi", dtype=dtype)
     return len(out)
 
 
@@ -676,84 +640,49 @@ def enviar_csv_para_banco(
     engine = criar_engine(database_name=db)
 
     try:
+        hash_arquivo = calcular_sha256(caminho) if caminho.exists() else ""
         df = ler_csv_seguro(caminho)
         if df.empty and len(df.columns) == 0:
             registrar_log(engine, id_carga, caminho.name, tabela_destino, 0, 0, "IGNORADO", "Arquivo vazio ou ilegível", if_exists)
-            return {
-                "Status": "IGNORADO",
-                "Arquivo": caminho.name,
-                "Tabela": tabela_destino,
-                "Linhas_Lidas": 0,
-                "Linhas_Gravadas": 0,
-                "Linhas_Ignoradas": 0,
-                "Mensagem": "Arquivo vazio ou ilegível",
-            }
+            return {"Status": "IGNORADO", "Arquivo": caminho.name, "Tabela": tabela_destino, "Linhas_Lidas": 0, "Linhas_Gravadas": 0, "Linhas_Ignoradas": 0, "Mensagem": "Arquivo vazio ou ilegível"}
 
-        out = preparar_dataframe_para_banco(df, id_carga, caminho.name)
+        out = preparar_dataframe_para_banco(df, id_carga, caminho.name, hash_arquivo=hash_arquivo)
         meta_incremental: Dict[str, object] = {}
-        if if_exists == "incremental":
+
+        if if_exists == "upsert":
+            gravadas = gravar_upsert_com_staging(out, tabela_sql, engine)
+        elif if_exists == "incremental":
             out, meta_incremental = filtrar_linhas_novas_banco(out, tabela_sql, engine)
-            modo_sql = "append"
-        elif if_exists == "upsert":
-            out, meta_incremental = preparar_upsert_por_chave_banco(out, tabela_sql, engine)
-            modo_sql = "append"
+            if out.empty:
+                registrar_log(engine, id_carga, caminho.name, tabela_destino, len(df), 0, "IGNORADO", "Nenhuma linha nova para gravar", if_exists)
+                return {"Status": "IGNORADO", "Arquivo": caminho.name, "Tabela": tabela_destino, "Linhas_Lidas": len(df), "Linhas_Gravadas": 0, "Linhas_Ignoradas": len(df), "Mensagem": "Nenhuma linha nova para gravar", **meta_incremental}
+            gravadas = enviar_dataframe(pd.DataFrame(), tabela_sql, engine, id_carga, caminho.name) if False else 0
+            if not tabela_existe(engine, tabela_sql):
+                chaves = CHAVES_UNICAS_BANCO.get(tabela_sql)
+                if chaves:
+                    garantir_tabela_final_com_pk(engine, tabela_sql, out, chaves)
+            else:
+                garantir_colunas_tabela(engine, tabela_sql, out)
+            dtype = {col: Text() for col in out.columns}
+            out.to_sql(tabela_sql, engine, if_exists="append", index=False, chunksize=1000, method="multi", dtype=dtype)
+            gravadas = len(out)
         else:
-            modo_sql = if_exists
+            if if_exists == "append":
+                garantir_colunas_tabela(engine, tabela_sql, out)
+            dtype = {col: Text() for col in out.columns}
+            out.to_sql(tabela_sql, engine, if_exists=if_exists, index=False, chunksize=1000, method="multi", dtype=dtype)
+            gravadas = len(out)
 
-        if out.empty:
-            mensagem = "Nenhuma linha nova para gravar"
-            registrar_log(engine, id_carga, caminho.name, tabela_destino, len(df), 0, "IGNORADO", mensagem, if_exists)
-            return {
-                "Status": "IGNORADO",
-                "Arquivo": caminho.name,
-                "Tabela": tabela_destino,
-                "Linhas_Lidas": len(df),
-                "Linhas_Gravadas": 0,
-                "Linhas_Ignoradas": len(df),
-                "Mensagem": mensagem,
-                **meta_incremental,
-            }
-
-        if modo_sql == "append":
-            garantir_colunas_tabela(engine, tabela_sql, out)
-
-        dtype = {col: Text() for col in out.columns}
-        out.to_sql(
-            tabela_sql,
-            engine,
-            if_exists=modo_sql,
-            index=False,
-            chunksize=1000,
-            method="multi",
-            dtype=dtype,
-        )
-        gravadas = len(out)
         ignoradas = max(len(df) - gravadas, 0) if if_exists == "incremental" else 0
-        registrar_log(engine, id_carga, caminho.name, tabela_destino, len(df), gravadas, "OK", "Carga gravada", if_exists)
-        return {
-            "Status": "OK",
-            "Arquivo": caminho.name,
-            "Tabela": tabela_destino,
-            "Linhas_Lidas": len(df),
-            "Linhas_Gravadas": gravadas,
-            "Linhas_Ignoradas": ignoradas,
-            "Mensagem": "Carga gravada",
-            **meta_incremental,
-        }
+        registrar_controle_carga(engine, id_carga, caminho, tabela_destino, hash_arquivo, gravadas)
+        registrar_log(engine, id_carga, caminho.name, tabela_destino, len(df), gravadas, "OK", "Carga gravada com validação", if_exists)
+        return {"Status": "OK", "Arquivo": caminho.name, "Tabela": tabela_destino, "Linhas_Lidas": len(df), "Linhas_Gravadas": gravadas, "Linhas_Ignoradas": ignoradas, "Mensagem": "Carga gravada com validação", "Hash_Arquivo": hash_arquivo, **meta_incremental}
     except Exception as exc:
         try:
             registrar_log(engine, id_carga, caminho.name, tabela_destino, 0, 0, "ERRO", str(exc), if_exists)
         except Exception:
             pass
-        return {
-            "Status": "ERRO",
-            "Arquivo": caminho.name,
-            "Tabela": tabela_destino,
-            "Linhas_Lidas": 0,
-            "Linhas_Gravadas": 0,
-            "Linhas_Ignoradas": 0,
-            "Mensagem": str(exc),
-        }
+        return {"Status": "ERRO", "Arquivo": caminho.name, "Tabela": tabela_destino, "Linhas_Lidas": 0, "Linhas_Gravadas": 0, "Linhas_Ignoradas": 0, "Mensagem": str(exc)}
 
 
 def enviar_pasta_saida_para_banco(
@@ -784,26 +713,23 @@ def enviar_pasta_saida_para_banco(
     return resultados
 
 
-
 def consultar_resumo_tabelas(database_name: Optional[str] = None, apenas_padrao: bool = True) -> pd.DataFrame:
-    """Retorna quantidade de linhas por tabela oficial do projeto no banco."""
     db = database_name or obter_database_name()
     engine = criar_engine(database_name=db)
     tabelas = sorted(set(ARQUIVOS_PADRAO.values())) if apenas_padrao else None
-
     if tabelas is None:
         df_tabelas = listar_tabelas(db)
         tabelas = df_tabelas["table_name"].astype(str).tolist() if not df_tabelas.empty else []
-
     linhas = []
     for tabela in tabelas:
         tabela_sql = limpar_identificador(tabela)
         if not tabela_existe(engine, tabela_sql):
-            linhas.append({"Tabela": tabela_sql, "Linhas_Banco": 0, "Status": "Não criada"})
+            linhas.append({"Tabela": tabela_sql, "Linhas_Banco": 0, "Primary_Key": "", "Status": "Não criada"})
             continue
         with engine.connect() as conn:
-            qtd = conn.execute(text(f'SELECT count(*) FROM "{tabela_sql}"')).scalar_one()
-        linhas.append({"Tabela": tabela_sql, "Linhas_Banco": int(qtd or 0), "Status": "OK"})
+            qtd = conn.execute(text(f'SELECT count(*) FROM {quote_ident(tabela_sql)}')).scalar_one()
+        pk = ", ".join(primary_key_da_tabela(engine, tabela_sql))
+        linhas.append({"Tabela": tabela_sql, "Linhas_Banco": int(qtd or 0), "Primary_Key": pk, "Status": "OK"})
     return pd.DataFrame(linhas)
 
 

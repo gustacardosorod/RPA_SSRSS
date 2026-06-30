@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-VERSAO_APP = "2026-06-18_RPA_SSRS_V7_COCKROACHDB"
+VERSAO_APP = "2026-06-29_RPA_SSRS_V8_STAGING_UPSERT_VALIDACAO"
 
 ARQUIVOS = {
     "volume": "Volume 4 - Daily",
@@ -20,6 +22,7 @@ ARQUIVOS = {
 
 CHAVES_INCREMENTAIS = {
     "f_agent_contact_diario": ["Data", "Atendente_ID", "Grupo"],
+    "f_agent_contact_fila_diario": ["Data", "Atendente_ID", "Grupo", "Fila"],
     "f_css_atendente": ["Periodo_Inicio", "Periodo_Fim", "Atendente_ID"],
     "f_fsr_tratado": ["Chave_FSR"],
     "f_reclamacoes_sap_tratado": ["Chave_SAP"],
@@ -628,25 +631,130 @@ def adicionar_origem_lote(df: pd.DataFrame, pasta_lote: Path) -> pd.DataFrame:
     return df
 
 
+def calcular_sha256(caminho: Path, bloco: int = 1024 * 1024) -> str:
+    caminho = Path(caminho)
+    h = hashlib.sha256()
+    with caminho.open("rb") as f:
+        for pedaco in iter(lambda: f.read(bloco), b""):
+            h.update(pedaco)
+    return h.hexdigest()
+
+
 def ler_relatorio_linhas(caminho: Path) -> List[List[str]]:
+    """Lê CSV/XLSX do SSRS sem descartar linha silenciosamente.
+
+    Para CSV, detecta separador entre vírgula, ponto e vírgula, tab e pipe.
+    Se houver erro estrutural, a carga deve falhar. Linha pulada em ETL é o tipo
+    de economia que cobra juros em dashboard.
+    """
+    caminho = Path(caminho)
     if caminho.suffix.lower() == ".csv":
-        for enc in ["utf-8-sig", "latin1"]:
+        ultimo_erro = None
+        for enc in ["utf-8-sig", "utf-8", "latin1"]:
             try:
                 with open(caminho, encoding=enc, newline="") as f:
-                    amostra = f.read(4096)
+                    amostra = f.read(8192)
                     f.seek(0)
                     try:
                         dialect = csv.Sniffer().sniff(amostra, delimiters=",;\t|")
                     except Exception:
                         dialect = csv.excel
-                    return list(csv.reader(f, dialect))
-            except UnicodeDecodeError:
+                    linhas = list(csv.reader(f, dialect))
+                    return linhas
+            except UnicodeDecodeError as exc:
+                ultimo_erro = exc
                 continue
+            except csv.Error as exc:
+                raise ValueError(f"CSV inválido em {caminho.name}: {exc}") from exc
+        if ultimo_erro:
+            raise ultimo_erro
     if caminho.suffix.lower() in [".xlsx", ".xls"]:
         df = pd.read_excel(caminho, header=None, dtype=str)
         return df.fillna("").values.tolist()
     raise ValueError(f"Formato não suportado: {caminho.suffix}")
 
+
+def gerar_manifest_arquivos(pasta: Path, arquivos: Optional[Iterable[Path]] = None) -> Dict[str, object]:
+    pasta = Path(pasta)
+    itens = list(arquivos) if arquivos is not None else sorted(p for p in pasta.glob("*") if p.is_file())
+    manifest = {
+        "pasta": str(pasta),
+        "gerado_em": datetime.now().isoformat(timespec="seconds"),
+        "arquivos": [],
+    }
+    for caminho in itens:
+        caminho = Path(caminho)
+        if not caminho.exists() or not caminho.is_file():
+            continue
+        manifest["arquivos"].append({
+            "nome": caminho.name,
+            "tamanho_bytes": caminho.stat().st_size,
+            "sha256": calcular_sha256(caminho),
+            "modificado_em": datetime.fromtimestamp(caminho.stat().st_mtime).isoformat(timespec="seconds"),
+        })
+    return manifest
+
+
+def salvar_manifest(pasta: Path, nome: str = "manifest.json") -> Path:
+    pasta = Path(pasta)
+    pasta.mkdir(parents=True, exist_ok=True)
+    caminho = pasta / nome
+    manifest = gerar_manifest_arquivos(pasta)
+    caminho.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return caminho
+
+
+def obter_janela_datas(df: pd.DataFrame, coluna_data: str = "Data") -> Tuple[pd.Timestamp, pd.Timestamp, int]:
+    if df is None or df.empty or coluna_data not in df.columns:
+        return pd.NaT, pd.NaT, 0
+    datas = parse_datas_mistas(df[coluna_data]).dropna()
+    if datas.empty:
+        return pd.NaT, pd.NaT, 0
+    return datas.min().normalize(), datas.max().normalize(), int(datas.nunique())
+
+
+def filtrar_datas_fechadas(
+    df: pd.DataFrame,
+    coluna_data: str = "Data",
+    bloquear_dia_atual: bool = True,
+    data_maxima: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """Remove datas futuras e, por padrão, o dia atual ainda aberto.
+
+    Rotina diária de indicador deve carregar D-1. Dia atual no SSRS é parcial e
+    parcial em BI vira debate filosófico com número errado.
+    """
+    if df is None or df.empty or coluna_data not in df.columns:
+        return df
+    base = df.copy()
+    datas = parse_datas_mistas(base[coluna_data])
+    base[coluna_data] = datas
+    if data_maxima is None:
+        hoje = pd.Timestamp(date.today()).normalize()
+        data_maxima = hoje - pd.Timedelta(days=1) if bloquear_dia_atual else hoje
+    else:
+        data_maxima = pd.Timestamp(data_maxima).normalize()
+    mascara = datas.notna() & (datas <= data_maxima)
+    removidas = int((~mascara).sum())
+    if removidas:
+        print(f"AVISO - {removidas} linha(s) removida(s) por data inválida, futura ou dia aberto em {coluna_data}.")
+    return base.loc[mascara].copy()
+
+
+def validar_chave_dataframe(df: pd.DataFrame, colunas_chave: List[str], nome_tabela: str) -> None:
+    if df is None or df.empty:
+        return
+    faltantes = [c for c in colunas_chave if c not in df.columns]
+    if faltantes:
+        raise ValueError(f"{nome_tabela}: chave ausente no DataFrame: {faltantes}")
+    chave = chave_normalizada(df, colunas_chave)
+    vazias = chave.astype(str).str.replace("|", "", regex=False).str.strip().eq("")
+    if vazias.any():
+        raise ValueError(f"{nome_tabela}: {int(vazias.sum())} linha(s) com chave vazia: {colunas_chave}")
+    duplicadas = chave.duplicated(keep=False)
+    if duplicadas.any():
+        exemplos = chave.loc[duplicadas].head(10).tolist()
+        raise ValueError(f"{nome_tabela}: duplicidade na chave {colunas_chave}. Exemplos: {exemplos}")
 
 def extrair_datas_parametros(linhas: List[List[str]]) -> List[pd.Timestamp]:
     texto = "\n".join([" | ".join(map(str, linha)) for linha in linhas[:8]])
